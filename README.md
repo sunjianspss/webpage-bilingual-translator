@@ -86,6 +86,10 @@ npm test
 npm run check
 ```
 
+## Releases
+
+稳定版本会发布到 GitHub Releases。每个 release 会包含对应 tag、更新说明，以及 GitHub 自动生成的源码压缩包。
+
 ## MVP 限制
 
 - 默认最多翻译当前页面前 220 个唯一正文片段。

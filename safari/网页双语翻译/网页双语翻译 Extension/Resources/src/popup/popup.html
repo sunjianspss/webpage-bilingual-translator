@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>网页双语翻译</title>
+    <link rel="stylesheet" href="./popup.css">
+  </head>
+  <body>
+    <main>
+      <header class="app-header">
+        <div>
+          <h1>网页双语翻译</h1>
+          <p id="page-title">翻译当前网页</p>
+        </div>
+        <span class="status-dot" id="status-dot" aria-hidden="true"></span>
+      </header>
+
+      <section class="primary-action">
+        <button type="button" class="primary" id="translate">翻译此页面</button>
+        <p class="message" id="message" role="status">准备就绪</p>
+      </section>
+
+      <section class="card">
+        <label class="field">
+          <span>翻译服务</span>
+          <select id="backend">
+            <option value="local">本地 API</option>
+            <option value="deepseek">DeepSeek API</option>
+          </select>
+        </label>
+
+        <div id="local-fields">
+          <label class="field">
+            <span>API 地址</span>
+            <input
+              id="local-base-url"
+              type="url"
+              spellcheck="false"
+              placeholder="http://127.0.0.1:1234/v1"
+            >
+          </label>
+          <label class="field">
+            <span>模型</span>
+            <input
+              id="local-model"
+              type="text"
+              spellcheck="false"
+              placeholder="qwen/qwen3.5-35b-a3b"
+            >
+          </label>
+          <label class="field">
+            <span>API Key <small>可选</small></span>
+            <input
+              id="local-api-key"
+              type="password"
+              autocomplete="off"
+              placeholder="本地服务通常不需要"
+            >
+          </label>
+        </div>
+
+        <div id="deepseek-fields" hidden>
+          <label class="field">
+            <span>API Key</span>
+            <input
+              id="deepseek-api-key"
+              type="password"
+              autocomplete="off"
+              placeholder="sk-..."
+            >
+          </label>
+          <label class="field">
+            <span>模型</span>
+            <select id="deepseek-model">
+              <option value="deepseek-v4-flash">DeepSeek V4 Flash</option>
+              <option value="deepseek-v4-pro">DeepSeek V4 Pro</option>
+            </select>
+          </label>
+        </div>
+
+        <label class="check-field field">
+          <input id="high-quality-reasoning" type="checkbox">
+          <span>
+            高质量推理
+            <small>长句和术语更稳，但整页翻译会明显变慢</small>
+          </span>
+        </label>
+
+        <label class="field">
+          <span>目标语言</span>
+          <select id="target-language">
+            <option value="zh-CN">简体中文</option>
+            <option value="zh-TW">繁體中文</option>
+            <option value="en">English</option>
+            <option value="ja">日本語</option>
+            <option value="ko">한국어</option>
+            <option value="fr">Français</option>
+            <option value="de">Deutsch</option>
+            <option value="es">Español</option>
+          </select>
+        </label>
+      </section>
+
+      <section class="card compact">
+        <span class="section-label">显示方式</span>
+        <div class="segmented" role="group" aria-label="显示方式">
+          <button type="button" data-mode="bilingual">双语对照</button>
+          <button type="button" data-mode="translated">仅显示译文</button>
+        </div>
+      </section>
+
+      <section class="card compact">
+        <span class="section-label">快捷键</span>
+        <div class="shortcut-row">
+          <kbd id="shortcut-value">Command+Shift+Y</kbd>
+          <button
+            type="button"
+            class="secondary compact-button"
+            id="customize-shortcut"
+          >
+            自定义
+          </button>
+        </div>
+        <p class="shortcut-note" id="shortcut-note">
+          在浏览器快捷键设置中修改
+        </p>
+      </section>
+
+      <div class="actions">
+        <button type="button" class="secondary" id="restore">恢复原文</button>
+      </div>
+
+      <p class="privacy-note">
+        网页正文会发送到所选翻译服务。API Key 仅保存在此浏览器中。
+      </p>
+    </main>
+    <script type="module" src="./popup.js"></script>
+  </body>
+</html>

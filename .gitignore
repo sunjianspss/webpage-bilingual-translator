@@ -1,0 +1,22 @@
+.DS_Store
+node_modules/
+npm-debug.log*
+
+# Generated local artifacts
+outputs/
+dist/
+build/
+coverage/
+
+# Xcode local state and build products
+DerivedData/
+*.xcuserstate
+*.xcuserdata/
+*.moved-aside
+*.xcscmblueprint
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+

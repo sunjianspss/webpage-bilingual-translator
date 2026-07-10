@@ -7,5 +7,8 @@
   "scripts": {
     "test": "node --test",
     "check": "node --check src/background.js && node --check src/content.js && node --check src/popup/popup.js"
+  },
+  "devDependencies": {
+    "jsdom": "^29.1.1"
   }
 }

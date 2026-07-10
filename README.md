@@ -12,7 +12,7 @@
 - 翻译进度与错误提示
 - 页面正文分批发送，API Key 不进入网页上下文
 - 本地 API 使用紧凑输入、动态 token 上限、首批预热和后续 2 路 worker，减少本地模型等待时间
-- DeepSeek 长页面批次并发翻译，本地 API 默认单路避免模型争抢
+- DeepSeek 长页面使用 3 路批次并发，本地 API 首批预热后使用 2 路 worker
 - 快捷键翻译当前页面：Windows/Linux `Ctrl+Shift+Y`，macOS `Command+Shift+Y`
 - 模型返回格式异常时自动拆分批次重试
 - 仅在用户打开扩展时向当前页面注入翻译脚本

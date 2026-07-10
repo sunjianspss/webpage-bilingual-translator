@@ -8,7 +8,38 @@
 import SafariServices
 import os.log
 
+private final class HTTPTaskRegistry: @unchecked Sendable {
+    private let lock = NSLock()
+    private var tasks: [String: URLSessionDataTask] = [:]
+
+    func insert(_ task: URLSessionDataTask, for requestId: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard tasks[requestId] == nil else {
+            return false
+        }
+        tasks[requestId] = task
+        return true
+    }
+
+    @discardableResult
+    func remove(_ requestId: String) -> URLSessionDataTask? {
+        lock.lock()
+        defer { lock.unlock() }
+        return tasks.removeValue(forKey: requestId)
+    }
+
+    func cancel(_ requestId: String) -> Bool {
+        let task = remove(requestId)
+        task?.cancel()
+        return task != nil
+    }
+}
+
 class SafariWebExtensionHandler: NSObject, NSExtensionRequestHandling {
+
+    private static let taskRegistry = HTTPTaskRegistry()
 
     func beginRequest(with context: NSExtensionContext) {
         let request = context.inputItems.first as? NSExtensionItem
@@ -29,15 +60,20 @@ class SafariWebExtensionHandler: NSObject, NSExtensionRequestHandling {
 
         os_log(.default, "Received native message (profile: %@)", profile?.uuidString ?? "none")
 
-        guard
-            let requestMessage = message as? [String: Any],
-            requestMessage["type"] as? String == "HTTP_REQUEST"
-        else {
+        guard let requestMessage = message as? [String: Any],
+              let messageType = requestMessage["type"] as? String else {
             complete(context, message: ["ok": false, "error": "不支持的原生请求"])
             return
         }
 
-        performHTTPRequest(requestMessage, context: context)
+        switch messageType {
+        case "HTTP_REQUEST":
+            performHTTPRequest(requestMessage, context: context)
+        case "CANCEL_HTTP_REQUEST":
+            cancelHTTPRequest(requestMessage, context: context)
+        default:
+            complete(context, message: ["ok": false, "error": "不支持的原生请求"])
+        }
     }
 
     private func performHTTPRequest(
@@ -45,6 +81,8 @@ class SafariWebExtensionHandler: NSObject, NSExtensionRequestHandling {
         context: NSExtensionContext
     ) {
         guard
+            let requestId = message["requestId"] as? String,
+            !requestId.isEmpty,
             let urlString = message["url"] as? String,
             let url = URL(string: urlString),
             isAllowed(url)
@@ -71,7 +109,9 @@ class SafariWebExtensionHandler: NSObject, NSExtensionRequestHandling {
             request.httpBody = body.data(using: .utf8)
         }
 
-        URLSession.shared.dataTask(with: request) { data, response, error in
+        let task = URLSession.shared.dataTask(with: request) { data, response, error in
+            Self.taskRegistry.remove(requestId)
+
             if let error {
                 self.complete(
                     context,
@@ -105,7 +145,37 @@ class SafariWebExtensionHandler: NSObject, NSExtensionRequestHandling {
                     "payload": payload
                 ]
             )
-        }.resume()
+        }
+
+        guard Self.taskRegistry.insert(task, for: requestId) else {
+            complete(
+                context,
+                message: ["ok": false, "error": "原生请求 ID 已存在"]
+            )
+            return
+        }
+        task.resume()
+    }
+
+    private func cancelHTTPRequest(
+        _ message: [String: Any],
+        context: NSExtensionContext
+    ) {
+        guard let requestId = message["requestId"] as? String,
+              !requestId.isEmpty else {
+            complete(context, message: ["ok": false, "error": "缺少原生请求 ID"])
+            return
+        }
+
+        let canceled = Self.taskRegistry.cancel(requestId)
+        complete(
+            context,
+            message: [
+                "ok": true,
+                "canceled": canceled,
+                "requestId": requestId
+            ]
+        )
     }
 
     private func isAllowed(_ url: URL) -> Bool {

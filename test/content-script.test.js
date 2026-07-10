@@ -131,17 +131,28 @@ test("page translation continues after the popup closes", async () => {
   );
 });
 
-test("Safari dispatches translation before waiting for storage", async () => {
+test("popup persists settings before creating a translation job", async () => {
   const [chromePopup, safariPopup] = await Promise.all([
     readFile(chromePopupUrl, "utf8"),
     readFile(safariPopupUrl, "utf8")
   ]);
 
   assert.equal(safariPopup, chromePopup);
-  assert.match(chromePopup, /backend: value\.backend/);
-  assert.match(chromePopup, /const responsePromise = sendToPage/);
-  assert.match(chromePopup, /Promise\.all\(\[\s*responsePromise,/);
-  assert.doesNotMatch(chromePopup, /settings = await persistForm\(true\)/);
+  assert.match(
+    chromePopup,
+    /await chrome\.storage\.local\.set\([\s\S]*const job = await createTranslationJob\(settings\)/
+  );
+  assert.match(chromePopup, /type: "CREATE_TRANSLATION_JOB"/);
+  assert.match(
+    chromePopup,
+    /type: "TRANSLATE_PAGE",\s*jobId,\s*pageSettings: job\.pageSettings/
+  );
+  assert.match(chromePopup, /if \(jobId && !pageStarted\)/);
+  assert.match(chromePopup, /type: "CANCEL_TRANSLATION_JOB"/);
+  assert.doesNotMatch(
+    chromePopup,
+    /type: "TRANSLATE_PAGE",\s*settings:/
+  );
 });
 
 test("Chrome and Safari use the same popup files", async () => {
@@ -222,5 +233,10 @@ test("background shortcut command injects the content script and starts translat
   assert.match(content, /chrome\.scripting\.executeScript\(\{/);
   assert.match(content, /files: \["src\/content\.js"\]/);
   assert.match(content, /type: "TRANSLATE_PAGE"/);
-  assert.match(content, /settings: pageSettings\(await loadTranslatorSettings\(\)\)/);
+  assert.match(
+    content,
+    /createTranslationJob\(\s*await loadTranslatorSettings\(\),\s*tab\.id\s*\)/
+  );
+  assert.match(content, /jobId: job\.jobId/);
+  assert.match(content, /pageSettings: job\.pageSettings/);
 });

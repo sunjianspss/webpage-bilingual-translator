@@ -21,7 +21,10 @@ const server = http.createServer((request, response) => {
         (message) => message.role === "user"
       );
       const input = JSON.parse(userMessage?.content || "{}");
-      const translations = (input.segments || []).map((segment) => ({
+      const segments = Array.isArray(input)
+        ? input.map(([id, text]) => ({ id, text }))
+        : input.segments || [];
+      const translations = segments.map((segment) => ({
         id: segment.id,
         text: `测试译文：${segment.text}`
       }));

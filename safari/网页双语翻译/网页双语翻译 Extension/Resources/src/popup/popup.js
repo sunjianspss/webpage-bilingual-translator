@@ -68,6 +68,8 @@ for (const button of elements.modeButtons) {
 
 elements.translate.addEventListener("click", async () => {
   setBusy(true);
+  let jobId = "";
+  let pageStarted = false;
   try {
     const nextSettings = readForm();
     validateSettings(nextSettings);
@@ -78,28 +80,31 @@ elements.translate.addEventListener("click", async () => {
       await ensureEndpointPermission(nextSettings.localBaseUrl);
     }
     settings = nextSettings;
-    const persistPromise = chrome.storage.local.set({
+    await chrome.storage.local.set({
       translatorSettings: settings
     });
-    const responsePromise = sendToPage({
+    const job = await createTranslationJob(settings);
+    jobId = job.jobId;
+    const response = await sendToPage({
       type: "TRANSLATE_PAGE",
-      settings: pageSettings(settings)
+      jobId,
+      pageSettings: job.pageSettings
     });
-    const [response] = await Promise.all([
-      responsePromise,
-      persistPromise
-    ]);
     if (response?.canceled) {
       return;
     }
     if (!response?.ok) {
       throw new Error(response?.error || "翻译失败");
     }
+    pageStarted = true;
     applyPageState(response.state);
   } catch (error) {
     setMessage(error.message, "error");
     setDot("error");
   } finally {
+    if (jobId && !pageStarted) {
+      await cancelTranslationJob(jobId);
+    }
     setBusy(false);
   }
 });
@@ -277,13 +282,27 @@ function needsEndpointPermission(baseUrl) {
   return url.hostname !== "127.0.0.1" && url.hostname !== "localhost";
 }
 
-function pageSettings(value) {
-  return {
-    backend: value.backend,
-    targetLanguage: value.targetLanguage,
-    viewMode: value.viewMode,
-    maxSegments: value.maxSegments
-  };
+async function createTranslationJob(value) {
+  const response = await chrome.runtime.sendMessage({
+    type: "CREATE_TRANSLATION_JOB",
+    settings: value,
+    tabId: activeTab?.id
+  });
+  if (!response?.ok || !response.jobId || !response.pageSettings) {
+    throw new Error(response?.error || "无法创建翻译任务");
+  }
+  return response;
+}
+
+async function cancelTranslationJob(jobId) {
+  try {
+    await chrome.runtime.sendMessage({
+      type: "CANCEL_TRANSLATION_JOB",
+      jobId
+    });
+  } catch {
+    // 页面没有启动时尽力清理后台任务，保留原始错误供用户查看。
+  }
 }
 
 async function ensureContentScript() {

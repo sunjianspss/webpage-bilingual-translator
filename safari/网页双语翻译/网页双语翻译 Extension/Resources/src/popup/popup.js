@@ -22,6 +22,7 @@ const elements = {
   message: document.querySelector("#message"),
   translate: document.querySelector("#translate"),
   restore: document.querySelector("#restore"),
+  retranslate: document.querySelector("#retranslate"),
   shortcutValue: document.querySelector("#shortcut-value"),
   shortcutNote: document.querySelector("#shortcut-note"),
   customizeShortcut: document.querySelector("#customize-shortcut")
@@ -66,7 +67,31 @@ for (const button of elements.modeButtons) {
   });
 }
 
-elements.translate.addEventListener("click", async () => {
+elements.translate.addEventListener("click", () => {
+  translatePage();
+});
+
+elements.retranslate.addEventListener("click", async () => {
+  setBusy(true);
+  try {
+    const restored = await sendToPage({ type: "RESTORE_PAGE" });
+    if (!restored?.ok) {
+      throw new Error(restored?.error || "无法恢复原文");
+    }
+    const cleared = await sendToPage({ type: "CLEAR_PAGE_CACHE" });
+    if (!cleared?.ok) {
+      throw new Error(cleared?.error || "无法清除翻译缓存");
+    }
+  } catch (error) {
+    setMessage(error.message, "error");
+    setDot("error");
+    setBusy(false);
+    return;
+  }
+  await translatePage();
+});
+
+async function translatePage() {
   setBusy(true);
   let jobId = "";
   let pageStarted = false;
@@ -107,7 +132,7 @@ elements.translate.addEventListener("click", async () => {
     }
     setBusy(false);
   }
-});
+}
 
 elements.restore.addEventListener("click", async () => {
   const response = await sendToPage({ type: "RESTORE_PAGE" });
@@ -158,6 +183,7 @@ async function initialize() {
     setMessage("此页面不支持翻译", "error");
     setDot("error");
     elements.translate.disabled = true;
+    elements.retranslate.disabled = true;
     return;
   }
 
@@ -365,6 +391,7 @@ function applyPageState(pageState) {
 function setBusy(isBusy) {
   elements.translate.disabled = isBusy;
   elements.restore.disabled = isBusy;
+  elements.retranslate.disabled = isBusy;
   if (isBusy) {
     setMessage("正在翻译，长页面可能需要一些时间", "");
     setDot("working");

@@ -120,6 +120,12 @@ function createHarness({
     return response;
   }
 
+  function dispatchAsync(message) {
+    return new Promise((resolve) => {
+      listeners[0](message, {}, resolve);
+    });
+  }
+
   function state() {
     return dispatch({ type: "GET_PAGE_STATE" }).state;
   }
@@ -147,6 +153,7 @@ function createHarness({
   return {
     close: () => dom.window.close(),
     dispatch,
+    dispatchAsync,
     document: window.document,
     requestedSegments,
     runtimeMessages,
@@ -538,6 +545,70 @@ test("translations persist across a page reload via chrome.storage.local", async
     "a cached translation should not trigger a new API request"
   );
   assert.match(second.document.querySelector("#para").textContent, /【译文:/);
+});
+
+test("CLEAR_PAGE_CACHE clears only the current page's cached translations", async (t) => {
+  const sharedStore = {};
+  const pageHtml = `<main><p id="para">Clearing the cache must force this paragraph to be retranslated.</p></main>`;
+  const otherHtml = `<main><p id="other">The other page keeps its cached translation untouched.</p></main>`;
+  const cacheKeyCount = () =>
+    Object.keys(sharedStore).filter((key) =>
+      key.startsWith("aiPageTranslatorCache:")
+    ).length;
+
+  const other = createHarness({
+    html: otherHtml,
+    url: "https://example.com/other",
+    storageStore: sharedStore
+  });
+  t.after(other.close);
+  other.start();
+  const otherState = await waitForTerminalState(other);
+  assert.equal(otherState.status, "done", otherState.error);
+
+  const first = createHarness({ html: pageHtml, storageStore: sharedStore });
+  t.after(first.close);
+  first.start();
+  const firstState = await waitForTerminalState(first);
+  assert.equal(firstState.status, "done", firstState.error);
+  await waitFor(
+    () => cacheKeyCount() >= 2,
+    "both pages' translations to be cached"
+  );
+
+  const cleared = await first.dispatchAsync({ type: "CLEAR_PAGE_CACHE" });
+  assert.equal(cleared.ok, true, cleared.error);
+  assert.equal(
+    cacheKeyCount(),
+    1,
+    "only the current page's cache entries should be removed"
+  );
+
+  const second = createHarness({ html: pageHtml, storageStore: sharedStore });
+  t.after(second.close);
+  second.start();
+  const secondState = await waitForTerminalState(second);
+  assert.equal(secondState.status, "done", secondState.error);
+  assert.equal(
+    second.requestedSegments().length,
+    1,
+    "the cleared page should be retranslated through the backend"
+  );
+
+  const otherAgain = createHarness({
+    html: otherHtml,
+    url: "https://example.com/other",
+    storageStore: sharedStore
+  });
+  t.after(otherAgain.close);
+  otherAgain.start();
+  const otherAgainState = await waitForTerminalState(otherAgain);
+  assert.equal(otherAgainState.status, "done", otherAgainState.error);
+  assert.equal(
+    otherAgain.requestedSegments().length,
+    0,
+    "other pages keep their cache after a scoped clear"
+  );
 });
 
 test("skips content that already matches the target language without calling the backend", async (t) => {

@@ -79,6 +79,19 @@
       return false;
     }
 
+    if (message?.type === "CLEAR_PAGE_CACHE") {
+      clearPagePersistentCache()
+        .then(() => sendResponse({ ok: true, state }))
+        .catch((error) =>
+          sendResponse({
+            ok: false,
+            error: error instanceof Error ? error.message : String(error),
+            state
+          })
+        );
+      return true;
+    }
+
     if (message?.type === "TRANSLATE_PAGE") {
       if (state.status === "translating") {
         sendResponse({
@@ -442,8 +455,43 @@
     return `${location.hostname}${location.pathname}`;
   }
 
+  function pageCachePrefix() {
+    return `${PERSISTENT_CACHE_KEY_PREFIX}${hashText(pageCacheScope())}:`;
+  }
+
+  function clearPagePersistentCache() {
+    activeSession?.translationCache.clear();
+    const storage = chrome?.storage?.local;
+    if (!storage) {
+      return Promise.resolve();
+    }
+    const prefix = pageCachePrefix();
+    const cleared = persistentCacheWriteChain.then(() =>
+      removePagePersistentEntries(storage, prefix)
+    );
+    persistentCacheWriteChain = cleared.catch(() => {});
+    return cleared;
+  }
+
+  async function removePagePersistentEntries(storage, prefix) {
+    const indexResult = await storage.get(PERSISTENT_CACHE_INDEX_KEY);
+    const index = Array.isArray(indexResult?.[PERSISTENT_CACHE_INDEX_KEY])
+      ? indexResult[PERSISTENT_CACHE_INDEX_KEY]
+      : [];
+    const pageKeys = index.filter((key) => key.startsWith(prefix));
+    if (pageKeys.length === 0) {
+      return;
+    }
+    await storage.set({
+      [PERSISTENT_CACHE_INDEX_KEY]: index.filter(
+        (key) => !key.startsWith(prefix)
+      )
+    });
+    await storage.remove(pageKeys);
+  }
+
   function persistentCacheKey(targetLanguage, groupKey) {
-    return `${PERSISTENT_CACHE_KEY_PREFIX}${hashText(
+    return `${pageCachePrefix()}${hashText(
       `${pageCacheScope()} ${targetLanguage} ${groupKey}`
     )}`;
   }

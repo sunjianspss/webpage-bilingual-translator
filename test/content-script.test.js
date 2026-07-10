@@ -208,6 +208,20 @@ test("popup includes shortcut customization controls", async () => {
   assert.match(popup, /chrome\.tabs\.create\(\{ url: SHORTCUTS_URL \}\)/);
 });
 
+test("popup offers a clear-cache retranslate action", async () => {
+  const [html, popup, content] = await Promise.all([
+    readFile(chromePopupHtmlUrl, "utf8"),
+    readFile(chromePopupUrl, "utf8"),
+    readFile(chromeContentUrl, "utf8")
+  ]);
+
+  assert.match(html, /id="retranslate"/);
+  assert.match(popup, /type: "CLEAR_PAGE_CACHE"/);
+  assert.match(popup, /type: "RESTORE_PAGE"/);
+  assert.match(content, /message\?\.type === "CLEAR_PAGE_CACHE"/);
+  assert.match(content, /function clearPagePersistentCache\(\)/);
+});
+
 test("local background compacts segment ids and restores original ids", async () => {
   const content = await readFile(
     chromeBackgroundUrl,

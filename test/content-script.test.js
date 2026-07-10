@@ -40,6 +40,22 @@ const safariManifestUrl = new URL(
 );
 const chromeBackgroundUrl = new URL("../src/background.js", import.meta.url);
 
+test("src/content.js matches the artifact built from src/content/ modules", async () => {
+  const { buildContentScript } = await import(
+    "../scripts/build-content.mjs"
+  );
+  const [built, current] = await Promise.all([
+    buildContentScript(),
+    readFile(chromeContentUrl, "utf8")
+  ]);
+
+  assert.equal(
+    current,
+    built,
+    "src/content.js is generated; edit src/content/ and run npm run build-content"
+  );
+});
+
 test("Chrome and Safari use the same content script", async () => {
   const [chromeContent, safariContent] = await Promise.all([
     readFile(chromeContentUrl, "utf8"),

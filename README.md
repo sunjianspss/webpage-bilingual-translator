@@ -89,6 +89,17 @@ npm test
 npm run check
 ```
 
+`src/content.js` 是生成文件，由 `src/content/` 下的模块拼接而成（content
+script 必须以单文件注入）。修改内容脚本时请编辑 `src/content/` 中的源文件，
+然后运行：
+
+```bash
+npm run build-content
+```
+
+该命令会重新生成 `src/content.js` 并同步 Safari 侧文件；测试会校验生成物
+与模块源码保持一致。
+
 ## Releases
 
 稳定版本会发布到 GitHub Releases。每个 release 会包含对应 tag、更新说明，以及 GitHub 自动生成的源码压缩包。

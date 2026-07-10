@@ -1,3 +1,5 @@
+// 本文件由 scripts/build-content.mjs 从 src/content/ 各模块拼接生成。
+// 请勿直接编辑;修改 src/content/ 后运行 npm run build-content。
 (() => {
   if (globalThis.__AI_PAGE_TRANSLATOR_LOADED__) {
     return;
@@ -181,6 +183,162 @@
     translatePage(session).catch((error) => {
       handleTaskError(session, error);
     });
+  }
+
+  function handleTaskError(session, error) {
+    if (!isCurrentSession(session)) {
+      return;
+    }
+    stopSessionActivity(session);
+    cancelBackgroundJob(session);
+    const messageText =
+      error instanceof Error ? error.message : String(error);
+    state = { ...state, status: "error", error: messageText };
+    showStatus(messageText, "error");
+  }
+
+  function cancelSession(session) {
+    stopSessionActivity(session);
+    cancelBackgroundJob(session);
+  }
+
+  function stopSessionActivity(session) {
+    session.observer?.disconnect();
+    if (session.mutationTimer !== null) {
+      window.clearTimeout(session.mutationTimer);
+      session.mutationTimer = null;
+    }
+    clearScheduledStatusHide(session);
+  }
+
+  function cancelBackgroundJob(session) {
+    if (session.jobClosed) {
+      return;
+    }
+    session.jobClosed = true;
+    sendJobMessage("CANCEL_TRANSLATION_JOB", session.jobId);
+  }
+
+  function sendJobMessage(type, jobId) {
+    if (!jobId) {
+      return;
+    }
+    try {
+      const pending = chrome.runtime.sendMessage({ type, jobId });
+      pending?.catch?.(() => {});
+    } catch (_error) {
+      // The page may be unloading or the extension may have been reloaded.
+    }
+  }
+
+  function isCurrentSession(session) {
+    return Boolean(
+      session &&
+      activeSession === session &&
+      session.taskId === taskGeneration
+    );
+  }
+
+  function setViewMode(viewMode) {
+    const nextMode =
+      viewMode === "translated" ? "translated" : "bilingual";
+    document.documentElement.classList.remove(...VIEW_CLASSES);
+    document.documentElement.classList.add(
+      nextMode === "translated"
+        ? "ai-page-translator-translated"
+        : "ai-page-translator-bilingual"
+    );
+    state = { ...state, viewMode: nextMode };
+  }
+
+  function cancelAndRestore() {
+    taskGeneration += 1;
+    if (activeSession) {
+      cancelSession(activeSession);
+      activeSession = null;
+    }
+    clearTranslations(state.viewMode);
+  }
+
+  function clearTranslations(viewMode) {
+    const translatedElements = document.querySelectorAll(`[${MARKER}]`);
+    for (const element of translatedElements) {
+      if (element.dataset.translatorTarget === "heading") {
+        const next = element.nextElementSibling;
+        if (next?.dataset.translatorForHeading === "true") {
+          next.remove();
+        }
+        element.removeAttribute(MARKER);
+        delete element.dataset.translatorTarget;
+        continue;
+      }
+      if (element.dataset.translatorTarget === "flow") {
+        const original = element.querySelector(
+          `:scope > .${ORIGINAL_CLASS}`
+        );
+        if (original && element.parentNode) {
+          while (original.firstChild) {
+            element.parentNode.insertBefore(original.firstChild, element);
+          }
+        }
+        element.remove();
+        continue;
+      }
+      if (element.dataset.translatorTarget === "element") {
+        element.querySelector(
+          `:scope > [data-translator-for-element='true']`
+        )?.remove();
+        element.removeAttribute(MARKER);
+        delete element.dataset.translatorTarget;
+        element.style.removeProperty(
+          "--ai-translator-element-original-size"
+        );
+        continue;
+      }
+      const original = element.querySelector(`:scope > .${ORIGINAL_CLASS}`);
+      const translation = element.querySelector(
+        `:scope > .${TRANSLATION_CLASS}`
+      );
+      if (element.dataset.translatorTarget === "text") {
+        element.replaceWith(
+          document.createTextNode(original?.textContent || "")
+        );
+        continue;
+      }
+      if (original) {
+        while (original.firstChild) {
+          element.insertBefore(original.firstChild, original);
+        }
+        original.remove();
+      }
+      translation?.remove();
+      element.removeAttribute(MARKER);
+      delete element.dataset.translatorTarget;
+    }
+    document.documentElement.classList.remove(...VIEW_CLASSES);
+    hideStatus();
+    state = {
+      status: "idle",
+      translated: 0,
+      total: 0,
+      viewMode:
+        viewMode === "translated" ? "translated" : "bilingual",
+      error: ""
+    };
+  }
+
+  function assertCurrentTask(taskId) {
+    if (
+      taskId !== taskGeneration ||
+      !activeSession ||
+      activeSession.taskId !== taskId ||
+      activeSession.jobClosed
+    ) {
+      const error = new Error("翻译任务已取消");
+      error.code = "TRANSLATION_CANCELED";
+      throw error;
+    }
+    return activeSession;
   }
 
   async function translatePage(session) {
@@ -434,162 +592,6 @@
     group.applied = true;
   }
 
-  function hashText(text) {
-    let h1 = 0xdeadbeef;
-    let h2 = 0x41c6ce57;
-    for (let index = 0; index < text.length; index += 1) {
-      const code = text.charCodeAt(index);
-      h1 = Math.imul(h1 ^ code, 2654435761);
-      h2 = Math.imul(h2 ^ code, 1597334677);
-    }
-    h1 =
-      Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^
-      Math.imul(h2 ^ (h2 >>> 13), 3266489909);
-    h2 =
-      Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^
-      Math.imul(h1 ^ (h1 >>> 13), 3266489909);
-    return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36);
-  }
-
-  function pageCacheScope() {
-    return `${location.hostname}${location.pathname}`;
-  }
-
-  function pageCachePrefix() {
-    return `${PERSISTENT_CACHE_KEY_PREFIX}${hashText(pageCacheScope())}:`;
-  }
-
-  function clearPagePersistentCache() {
-    activeSession?.translationCache.clear();
-    const storage = chrome?.storage?.local;
-    if (!storage) {
-      return Promise.resolve();
-    }
-    const prefix = pageCachePrefix();
-    const cleared = persistentCacheWriteChain.then(() =>
-      removePagePersistentEntries(storage, prefix)
-    );
-    persistentCacheWriteChain = cleared.catch(() => {});
-    return cleared;
-  }
-
-  async function removePagePersistentEntries(storage, prefix) {
-    const indexResult = await storage.get(PERSISTENT_CACHE_INDEX_KEY);
-    const index = Array.isArray(indexResult?.[PERSISTENT_CACHE_INDEX_KEY])
-      ? indexResult[PERSISTENT_CACHE_INDEX_KEY]
-      : [];
-    const pageKeys = index.filter((key) => key.startsWith(prefix));
-    if (pageKeys.length === 0) {
-      return;
-    }
-    await storage.set({
-      [PERSISTENT_CACHE_INDEX_KEY]: index.filter(
-        (key) => !key.startsWith(prefix)
-      )
-    });
-    await storage.remove(pageKeys);
-  }
-
-  function persistentCacheKey(targetLanguage, groupKey) {
-    return `${pageCachePrefix()}${hashText(
-      `${pageCacheScope()} ${targetLanguage} ${groupKey}`
-    )}`;
-  }
-
-  async function hydratePersistentCache(session, groups) {
-    const storage = chrome?.storage?.local;
-    if (!storage) {
-      return;
-    }
-    const targetLanguage = session.settings.targetLanguage;
-    const lookup = new Map();
-    for (const group of groups) {
-      if (session.translationCache.has(group.key)) {
-        continue;
-      }
-      lookup.set(persistentCacheKey(targetLanguage, group.key), group.key);
-    }
-    if (lookup.size === 0) {
-      return;
-    }
-
-    let stored;
-    try {
-      stored = await storage.get([...lookup.keys()]);
-    } catch (_error) {
-      return;
-    }
-    for (const [storageKey, groupKey] of lookup) {
-      const text = stored?.[storageKey];
-      if (typeof text === "string" && text) {
-        session.translationCache.set(groupKey, text);
-      }
-    }
-  }
-
-  function queuePersistentCacheWrite(session, groupKey, translatedText) {
-    const storage = chrome?.storage?.local;
-    if (!storage) {
-      return;
-    }
-    const storageKey = persistentCacheKey(
-      session.settings.targetLanguage,
-      groupKey
-    );
-    persistentCacheWriteChain = persistentCacheWriteChain
-      .then(() =>
-        writePersistentCacheEntry(storage, storageKey, translatedText)
-      )
-      .catch(() => {});
-  }
-
-  async function writePersistentCacheEntry(storage, storageKey, text) {
-    const indexResult = await storage.get(PERSISTENT_CACHE_INDEX_KEY);
-    const index = Array.isArray(indexResult?.[PERSISTENT_CACHE_INDEX_KEY])
-      ? indexResult[PERSISTENT_CACHE_INDEX_KEY]
-      : [];
-    const nextIndex = index.filter((key) => key !== storageKey);
-    nextIndex.push(storageKey);
-
-    const evicted = [];
-    while (nextIndex.length > PERSISTENT_CACHE_MAX_ENTRIES) {
-      evicted.push(nextIndex.shift());
-    }
-
-    await storage.set({
-      [storageKey]: text,
-      [PERSISTENT_CACHE_INDEX_KEY]: nextIndex
-    });
-    if (evicted.length > 0) {
-      await storage.remove(evicted);
-    }
-  }
-
-  function scriptCharRatio(text, pattern) {
-    const characters = [...text].filter((char) => /\S/u.test(char));
-    if (characters.length === 0) {
-      return 0;
-    }
-    const matched = characters.filter((char) => pattern.test(char)).length;
-    return matched / characters.length;
-  }
-
-  function isAlreadyTargetLanguage(text, targetLanguage) {
-    const pattern = TARGET_LANGUAGE_SCRIPT_PATTERNS[targetLanguage];
-    if (!pattern) {
-      return false;
-    }
-    return scriptCharRatio(text, pattern) >= 0.5;
-  }
-
-  function showTranslationProgress(session) {
-    state = { ...state, translated: session.usedPlacements };
-    showStatus(
-      `正在翻译 ${session.usedPlacements} / ${state.total}`,
-      "working"
-    );
-  }
-
   async function translateCandidateBatches(
     batches,
     concurrency,
@@ -693,6 +695,203 @@
       }
     }
     throw new Error(lastError);
+  }
+
+  function makeBatches(candidates, settings) {
+    const batches = [];
+    let current = [];
+    let characters = 0;
+    const isLocal = settings?.backend !== "deepseek";
+    for (const candidate of candidates) {
+      const isFirstBatch = batches.length === 0;
+      const segmentLimit = isFirstBatch
+        ? (
+          isLocal
+            ? LOCAL_FIRST_BATCH_SEGMENT_LIMIT
+            : REMOTE_FIRST_BATCH_SEGMENT_LIMIT
+        )
+        : (
+          isLocal
+            ? LOCAL_BATCH_SEGMENT_LIMIT
+            : REMOTE_BATCH_SEGMENT_LIMIT
+        );
+      const characterLimit = isFirstBatch
+        ? (
+          isLocal
+            ? LOCAL_FIRST_BATCH_CHARACTER_LIMIT
+            : REMOTE_FIRST_BATCH_CHARACTER_LIMIT
+        )
+        : (
+          isLocal
+            ? LOCAL_BATCH_CHARACTER_LIMIT
+            : REMOTE_BATCH_CHARACTER_LIMIT
+        );
+      if (
+        current.length > 0 &&
+        (
+          current.length >= segmentLimit ||
+          characters + candidate.text.length > characterLimit
+        )
+      ) {
+        batches.push(current);
+        current = [];
+        characters = 0;
+      }
+      current.push(candidate);
+      characters += candidate.text.length;
+    }
+    if (current.length > 0) {
+      batches.push(current);
+    }
+    return batches;
+  }
+
+  function hashText(text) {
+    let h1 = 0xdeadbeef;
+    let h2 = 0x41c6ce57;
+    for (let index = 0; index < text.length; index += 1) {
+      const code = text.charCodeAt(index);
+      h1 = Math.imul(h1 ^ code, 2654435761);
+      h2 = Math.imul(h2 ^ code, 1597334677);
+    }
+    h1 =
+      Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^
+      Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+    h2 =
+      Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^
+      Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+    return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36);
+  }
+
+  function pageCacheScope() {
+    return `${location.hostname}${location.pathname}`;
+  }
+
+  function pageCachePrefix() {
+    return `${PERSISTENT_CACHE_KEY_PREFIX}${hashText(pageCacheScope())}:`;
+  }
+
+  function clearPagePersistentCache() {
+    activeSession?.translationCache.clear();
+    const storage = chrome?.storage?.local;
+    if (!storage) {
+      return Promise.resolve();
+    }
+    const prefix = pageCachePrefix();
+    const cleared = persistentCacheWriteChain.then(() =>
+      removePagePersistentEntries(storage, prefix)
+    );
+    persistentCacheWriteChain = cleared.catch(() => {});
+    return cleared;
+  }
+
+  async function removePagePersistentEntries(storage, prefix) {
+    const indexResult = await storage.get(PERSISTENT_CACHE_INDEX_KEY);
+    const index = Array.isArray(indexResult?.[PERSISTENT_CACHE_INDEX_KEY])
+      ? indexResult[PERSISTENT_CACHE_INDEX_KEY]
+      : [];
+    const pageKeys = index.filter((key) => key.startsWith(prefix));
+    if (pageKeys.length === 0) {
+      return;
+    }
+    await storage.set({
+      [PERSISTENT_CACHE_INDEX_KEY]: index.filter(
+        (key) => !key.startsWith(prefix)
+      )
+    });
+    await storage.remove(pageKeys);
+  }
+
+  function persistentCacheKey(targetLanguage, groupKey) {
+    return `${pageCachePrefix()}${hashText(
+      `${pageCacheScope()}\u0000${targetLanguage}\u0000${groupKey}`
+    )}`;
+  }
+
+  async function hydratePersistentCache(session, groups) {
+    const storage = chrome?.storage?.local;
+    if (!storage) {
+      return;
+    }
+    const targetLanguage = session.settings.targetLanguage;
+    const lookup = new Map();
+    for (const group of groups) {
+      if (session.translationCache.has(group.key)) {
+        continue;
+      }
+      lookup.set(persistentCacheKey(targetLanguage, group.key), group.key);
+    }
+    if (lookup.size === 0) {
+      return;
+    }
+
+    let stored;
+    try {
+      stored = await storage.get([...lookup.keys()]);
+    } catch (_error) {
+      return;
+    }
+    for (const [storageKey, groupKey] of lookup) {
+      const text = stored?.[storageKey];
+      if (typeof text === "string" && text) {
+        session.translationCache.set(groupKey, text);
+      }
+    }
+  }
+
+  function queuePersistentCacheWrite(session, groupKey, translatedText) {
+    const storage = chrome?.storage?.local;
+    if (!storage) {
+      return;
+    }
+    const storageKey = persistentCacheKey(
+      session.settings.targetLanguage,
+      groupKey
+    );
+    persistentCacheWriteChain = persistentCacheWriteChain
+      .then(() =>
+        writePersistentCacheEntry(storage, storageKey, translatedText)
+      )
+      .catch(() => {});
+  }
+
+  async function writePersistentCacheEntry(storage, storageKey, text) {
+    const indexResult = await storage.get(PERSISTENT_CACHE_INDEX_KEY);
+    const index = Array.isArray(indexResult?.[PERSISTENT_CACHE_INDEX_KEY])
+      ? indexResult[PERSISTENT_CACHE_INDEX_KEY]
+      : [];
+    const nextIndex = index.filter((key) => key !== storageKey);
+    nextIndex.push(storageKey);
+
+    const evicted = [];
+    while (nextIndex.length > PERSISTENT_CACHE_MAX_ENTRIES) {
+      evicted.push(nextIndex.shift());
+    }
+
+    await storage.set({
+      [storageKey]: text,
+      [PERSISTENT_CACHE_INDEX_KEY]: nextIndex
+    });
+    if (evicted.length > 0) {
+      await storage.remove(evicted);
+    }
+  }
+
+  function scriptCharRatio(text, pattern) {
+    const characters = [...text].filter((char) => /\S/u.test(char));
+    if (characters.length === 0) {
+      return 0;
+    }
+    const matched = characters.filter((char) => pattern.test(char)).length;
+    return matched / characters.length;
+  }
+
+  function isAlreadyTargetLanguage(text, targetLanguage) {
+    const pattern = TARGET_LANGUAGE_SCRIPT_PATTERNS[targetLanguage];
+    if (!pattern) {
+      return false;
+    }
+    return scriptCharRatio(text, pattern) >= 0.5;
   }
 
   function normalizePlacementLimit(value) {
@@ -1186,55 +1385,6 @@
     return -1;
   }
 
-  function makeBatches(candidates, settings) {
-    const batches = [];
-    let current = [];
-    let characters = 0;
-    const isLocal = settings?.backend !== "deepseek";
-    for (const candidate of candidates) {
-      const isFirstBatch = batches.length === 0;
-      const segmentLimit = isFirstBatch
-        ? (
-          isLocal
-            ? LOCAL_FIRST_BATCH_SEGMENT_LIMIT
-            : REMOTE_FIRST_BATCH_SEGMENT_LIMIT
-        )
-        : (
-          isLocal
-            ? LOCAL_BATCH_SEGMENT_LIMIT
-            : REMOTE_BATCH_SEGMENT_LIMIT
-        );
-      const characterLimit = isFirstBatch
-        ? (
-          isLocal
-            ? LOCAL_FIRST_BATCH_CHARACTER_LIMIT
-            : REMOTE_FIRST_BATCH_CHARACTER_LIMIT
-        )
-        : (
-          isLocal
-            ? LOCAL_BATCH_CHARACTER_LIMIT
-            : REMOTE_BATCH_CHARACTER_LIMIT
-        );
-      if (
-        current.length > 0 &&
-        (
-          current.length >= segmentLimit ||
-          characters + candidate.text.length > characterLimit
-        )
-      ) {
-        batches.push(current);
-        current = [];
-        characters = 0;
-      }
-      current.push(candidate);
-      characters += candidate.text.length;
-    }
-    if (current.length > 0) {
-      batches.push(current);
-    }
-    return batches;
-  }
-
   function applyTranslation(
     target,
     targetType,
@@ -1546,6 +1696,14 @@
     }, delay);
   }
 
+  function showTranslationProgress(session) {
+    state = { ...state, translated: session.usedPlacements };
+    showStatus(
+      `正在翻译 ${session.usedPlacements} / ${state.total}`,
+      "working"
+    );
+  }
+
   function scheduleStatusHide(session) {
     clearScheduledStatusHide(session);
     session.statusHideTimer = window.setTimeout(() => {
@@ -1561,162 +1719,6 @@
       window.clearTimeout(session.statusHideTimer);
       session.statusHideTimer = null;
     }
-  }
-
-  function handleTaskError(session, error) {
-    if (!isCurrentSession(session)) {
-      return;
-    }
-    stopSessionActivity(session);
-    cancelBackgroundJob(session);
-    const messageText =
-      error instanceof Error ? error.message : String(error);
-    state = { ...state, status: "error", error: messageText };
-    showStatus(messageText, "error");
-  }
-
-  function cancelSession(session) {
-    stopSessionActivity(session);
-    cancelBackgroundJob(session);
-  }
-
-  function stopSessionActivity(session) {
-    session.observer?.disconnect();
-    if (session.mutationTimer !== null) {
-      window.clearTimeout(session.mutationTimer);
-      session.mutationTimer = null;
-    }
-    clearScheduledStatusHide(session);
-  }
-
-  function cancelBackgroundJob(session) {
-    if (session.jobClosed) {
-      return;
-    }
-    session.jobClosed = true;
-    sendJobMessage("CANCEL_TRANSLATION_JOB", session.jobId);
-  }
-
-  function sendJobMessage(type, jobId) {
-    if (!jobId) {
-      return;
-    }
-    try {
-      const pending = chrome.runtime.sendMessage({ type, jobId });
-      pending?.catch?.(() => {});
-    } catch (_error) {
-      // The page may be unloading or the extension may have been reloaded.
-    }
-  }
-
-  function isCurrentSession(session) {
-    return Boolean(
-      session &&
-      activeSession === session &&
-      session.taskId === taskGeneration
-    );
-  }
-
-  function setViewMode(viewMode) {
-    const nextMode =
-      viewMode === "translated" ? "translated" : "bilingual";
-    document.documentElement.classList.remove(...VIEW_CLASSES);
-    document.documentElement.classList.add(
-      nextMode === "translated"
-        ? "ai-page-translator-translated"
-        : "ai-page-translator-bilingual"
-    );
-    state = { ...state, viewMode: nextMode };
-  }
-
-  function cancelAndRestore() {
-    taskGeneration += 1;
-    if (activeSession) {
-      cancelSession(activeSession);
-      activeSession = null;
-    }
-    clearTranslations(state.viewMode);
-  }
-
-  function clearTranslations(viewMode) {
-    const translatedElements = document.querySelectorAll(`[${MARKER}]`);
-    for (const element of translatedElements) {
-      if (element.dataset.translatorTarget === "heading") {
-        const next = element.nextElementSibling;
-        if (next?.dataset.translatorForHeading === "true") {
-          next.remove();
-        }
-        element.removeAttribute(MARKER);
-        delete element.dataset.translatorTarget;
-        continue;
-      }
-      if (element.dataset.translatorTarget === "flow") {
-        const original = element.querySelector(
-          `:scope > .${ORIGINAL_CLASS}`
-        );
-        if (original && element.parentNode) {
-          while (original.firstChild) {
-            element.parentNode.insertBefore(original.firstChild, element);
-          }
-        }
-        element.remove();
-        continue;
-      }
-      if (element.dataset.translatorTarget === "element") {
-        element.querySelector(
-          `:scope > [data-translator-for-element='true']`
-        )?.remove();
-        element.removeAttribute(MARKER);
-        delete element.dataset.translatorTarget;
-        element.style.removeProperty(
-          "--ai-translator-element-original-size"
-        );
-        continue;
-      }
-      const original = element.querySelector(`:scope > .${ORIGINAL_CLASS}`);
-      const translation = element.querySelector(
-        `:scope > .${TRANSLATION_CLASS}`
-      );
-      if (element.dataset.translatorTarget === "text") {
-        element.replaceWith(
-          document.createTextNode(original?.textContent || "")
-        );
-        continue;
-      }
-      if (original) {
-        while (original.firstChild) {
-          element.insertBefore(original.firstChild, original);
-        }
-        original.remove();
-      }
-      translation?.remove();
-      element.removeAttribute(MARKER);
-      delete element.dataset.translatorTarget;
-    }
-    document.documentElement.classList.remove(...VIEW_CLASSES);
-    hideStatus();
-    state = {
-      status: "idle",
-      translated: 0,
-      total: 0,
-      viewMode:
-        viewMode === "translated" ? "translated" : "bilingual",
-      error: ""
-    };
-  }
-
-  function assertCurrentTask(taskId) {
-    if (
-      taskId !== taskGeneration ||
-      !activeSession ||
-      activeSession.taskId !== taskId ||
-      activeSession.jobClosed
-    ) {
-      const error = new Error("翻译任务已取消");
-      error.code = "TRANSLATION_CANCELED";
-      throw error;
-    }
-    return activeSession;
   }
 
   function ensureStyles() {

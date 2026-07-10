@@ -28,6 +28,11 @@ const safariPopupCssUrl = new URL(
   "../safari/网页双语翻译/网页双语翻译 Extension/Resources/src/popup/popup.css",
   import.meta.url
 );
+const chromeSharedUrl = new URL("../src/shared.js", import.meta.url);
+const safariSharedUrl = new URL(
+  "../safari/网页双语翻译/网页双语翻译 Extension/Resources/src/shared.js",
+  import.meta.url
+);
 const chromeManifestUrl = new URL("../manifest.json", import.meta.url);
 const safariManifestUrl = new URL(
   "../safari/网页双语翻译/网页双语翻译 Extension/Resources/manifest.json",
@@ -42,6 +47,15 @@ test("Chrome and Safari use the same content script", async () => {
   ]);
 
   assert.equal(safariContent, chromeContent);
+});
+
+test("Chrome and Safari use the same shared translation logic", async () => {
+  const [chromeShared, safariShared] = await Promise.all([
+    readFile(chromeSharedUrl, "utf8"),
+    readFile(safariSharedUrl, "utf8")
+  ]);
+
+  assert.equal(safariShared, chromeShared);
 });
 
 test("social post bodies are treated as structured translation units", async () => {

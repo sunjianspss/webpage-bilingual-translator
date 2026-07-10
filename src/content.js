@@ -39,7 +39,17 @@
   // 这样长推文仍可整体翻译而不会被静默跳过。
   const STRUCTURED_TEXT_MAX_LENGTH = 4000;
   const MUTATION_SCAN_DEBOUNCE_MS = 120;
+  const PERSISTENT_CACHE_KEY_PREFIX = "aiPageTranslatorCache:";
+  const PERSISTENT_CACHE_INDEX_KEY = "aiPageTranslatorCacheIndex";
+  const PERSISTENT_CACHE_MAX_ENTRIES = 3000;
+  const TARGET_LANGUAGE_SCRIPT_PATTERNS = {
+    "zh-CN": /[\u3400-\u9fff]/,
+    "zh-TW": /[\u3400-\u9fff]/,
+    ja: /[\u3040-\u30ff\u3400-\u9fff]/,
+    ko: /[\uac00-\ud7af]/
+  };
   let taskGeneration = 0;
+  let persistentCacheWriteChain = Promise.resolve();
   let activeSession = null;
   let pendingStartJobId = "";
 
@@ -221,6 +231,9 @@
       const collected = collectCandidates(
         session.maxPlacements +
           session.pendingRetranslationTargets.size
+      ).filter(
+        (placement) =>
+          !isAlreadyTargetLanguage(placement.text, settings.targetLanguage)
       );
       let availableNewPlacements = remaining;
       const placements = collected.filter((placement) => {
@@ -251,7 +264,7 @@
       };
       showTranslationProgress(session);
 
-      const groups = groupCandidatePlacements(placements, session);
+      const groups = await groupCandidatePlacements(placements, session);
       for (const group of groups) {
         const cached = session.translationCache.get(group.key);
         if (cached) {
@@ -294,6 +307,11 @@
                   .join(group.preserveLayout ? "\n" : " ");
                 session.translationCache.set(group.key, translatedText);
                 applyTranslatedGroup(session, group, translatedText);
+                queuePersistentCacheWrite(
+                  session,
+                  group.key,
+                  translatedText
+                );
               }
             }
             showTranslationProgress(session);
@@ -320,7 +338,7 @@
     }
   }
 
-  function groupCandidatePlacements(placements, session) {
+  async function groupCandidatePlacements(placements, session) {
     const groupsByKey = new Map();
     for (const placement of placements) {
       const preserveLayout = Boolean(placement.preserveLayout);
@@ -340,6 +358,8 @@
       }
       group.placements.push(placement);
     }
+
+    await hydratePersistentCache(session, [...groupsByKey.values()]);
 
     for (const group of groupsByKey.values()) {
       if (session.translationCache.has(group.key)) {
@@ -399,6 +419,119 @@
     });
     session.usedPlacements += newPlacements;
     group.applied = true;
+  }
+
+  function hashText(text) {
+    let h1 = 0xdeadbeef;
+    let h2 = 0x41c6ce57;
+    for (let index = 0; index < text.length; index += 1) {
+      const code = text.charCodeAt(index);
+      h1 = Math.imul(h1 ^ code, 2654435761);
+      h2 = Math.imul(h2 ^ code, 1597334677);
+    }
+    h1 =
+      Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^
+      Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+    h2 =
+      Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^
+      Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+    return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36);
+  }
+
+  function pageCacheScope() {
+    return `${location.hostname}${location.pathname}`;
+  }
+
+  function persistentCacheKey(targetLanguage, groupKey) {
+    return `${PERSISTENT_CACHE_KEY_PREFIX}${hashText(
+      `${pageCacheScope()} ${targetLanguage} ${groupKey}`
+    )}`;
+  }
+
+  async function hydratePersistentCache(session, groups) {
+    const storage = chrome?.storage?.local;
+    if (!storage) {
+      return;
+    }
+    const targetLanguage = session.settings.targetLanguage;
+    const lookup = new Map();
+    for (const group of groups) {
+      if (session.translationCache.has(group.key)) {
+        continue;
+      }
+      lookup.set(persistentCacheKey(targetLanguage, group.key), group.key);
+    }
+    if (lookup.size === 0) {
+      return;
+    }
+
+    let stored;
+    try {
+      stored = await storage.get([...lookup.keys()]);
+    } catch (_error) {
+      return;
+    }
+    for (const [storageKey, groupKey] of lookup) {
+      const text = stored?.[storageKey];
+      if (typeof text === "string" && text) {
+        session.translationCache.set(groupKey, text);
+      }
+    }
+  }
+
+  function queuePersistentCacheWrite(session, groupKey, translatedText) {
+    const storage = chrome?.storage?.local;
+    if (!storage) {
+      return;
+    }
+    const storageKey = persistentCacheKey(
+      session.settings.targetLanguage,
+      groupKey
+    );
+    persistentCacheWriteChain = persistentCacheWriteChain
+      .then(() =>
+        writePersistentCacheEntry(storage, storageKey, translatedText)
+      )
+      .catch(() => {});
+  }
+
+  async function writePersistentCacheEntry(storage, storageKey, text) {
+    const indexResult = await storage.get(PERSISTENT_CACHE_INDEX_KEY);
+    const index = Array.isArray(indexResult?.[PERSISTENT_CACHE_INDEX_KEY])
+      ? indexResult[PERSISTENT_CACHE_INDEX_KEY]
+      : [];
+    const nextIndex = index.filter((key) => key !== storageKey);
+    nextIndex.push(storageKey);
+
+    const evicted = [];
+    while (nextIndex.length > PERSISTENT_CACHE_MAX_ENTRIES) {
+      evicted.push(nextIndex.shift());
+    }
+
+    await storage.set({
+      [storageKey]: text,
+      [PERSISTENT_CACHE_INDEX_KEY]: nextIndex
+    });
+    if (evicted.length > 0) {
+      await storage.remove(evicted);
+    }
+  }
+
+  function scriptCharRatio(text, pattern) {
+    const characters = [...text].filter((char) => /\S/u.test(char));
+    if (characters.length === 0) {
+      return 0;
+    }
+    const matched = characters.filter((char) => pattern.test(char)).length;
+    return matched / characters.length;
+  }
+
+  function isAlreadyTargetLanguage(text, targetLanguage) {
+    const pattern = TARGET_LANGUAGE_SCRIPT_PATTERNS[targetLanguage];
+    if (!pattern) {
+      return false;
+    }
+    return scriptCharRatio(text, pattern) >= 0.5;
   }
 
   function showTranslationProgress(session) {

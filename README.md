@@ -11,6 +11,8 @@
 - DeepSeek API
 - 翻译进度与错误提示
 - 页面正文分批发送，API Key 不进入网页上下文
+- 翻译结果按“页面 + 目标语言”缓存到 `chrome.storage.local`，刷新页面无需重新翻译（缓存上限约 3000 条，超出后淘汰最早写入的条目）
+- 已是目标语言的正文（按 CJK 字符占比判断，覆盖简体中文、繁体中文、日语、韩语目标语言）会自动跳过，不发送翻译请求
 - 本地 API 使用紧凑输入、动态 token 上限、首批预热和后续 2 路 worker，减少本地模型等待时间
 - DeepSeek 长页面使用 3 路批次并发，本地 API 首批预热后使用 2 路 worker
 - 快捷键翻译当前页面：Windows/Linux `Ctrl+Shift+Y`，macOS `Command+Shift+Y`

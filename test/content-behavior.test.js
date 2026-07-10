@@ -25,10 +25,37 @@ function successfulTranslation(message) {
   };
 }
 
+function createStorageLocalMock(store) {
+  return {
+    async get(keys) {
+      if (keys === undefined || keys === null) {
+        return { ...store };
+      }
+      const keyList = Array.isArray(keys) ? keys : [keys];
+      const result = {};
+      for (const key of keyList) {
+        if (key in store) {
+          result[key] = store[key];
+        }
+      }
+      return result;
+    },
+    async set(items) {
+      Object.assign(store, items);
+    },
+    async remove(keys) {
+      for (const key of Array.isArray(keys) ? keys : [keys]) {
+        delete store[key];
+      }
+    }
+  };
+}
+
 function createHarness({
   html,
   url = "https://example.com/article",
-  translate = successfulTranslation
+  translate = successfulTranslation,
+  storageStore = {}
 }) {
   const dom = new JSDOM(html, {
     url,
@@ -76,6 +103,9 @@ function createHarness({
         }
         return { ok: true };
       }
+    },
+    storage: {
+      local: createStorageLocalMock(storageStore)
     }
   };
 
@@ -262,7 +292,7 @@ test("keeps meaningful one- and two-character paragraph text", async (t) => {
   });
   t.after(harness.close);
 
-  harness.start();
+  harness.start({ targetLanguage: "en" });
   const state = await waitForTerminalState(harness);
 
   assert.equal(state.status, "done", state.error);
@@ -474,4 +504,59 @@ test("RESTORE_PAGE cancels backend work and restores partially translated DOM", 
     );
   }
   assert.equal(harness.state().status, "idle");
+});
+
+test("translations persist across a page reload via chrome.storage.local", async (t) => {
+  const html = `<main><p id="para">A persistent cache should avoid retranslating this exact paragraph text.</p></main>`;
+  const sharedStore = {};
+
+  const first = createHarness({ html, storageStore: sharedStore });
+  t.after(first.close);
+  first.start();
+  const firstState = await waitForTerminalState(first);
+  assert.equal(firstState.status, "done", firstState.error);
+  assert.equal(first.requestedSegments().length, 1);
+  assert.match(first.document.querySelector("#para").textContent, /【译文:/);
+
+  await waitFor(
+    () =>
+      Object.keys(sharedStore).some((key) =>
+        key.startsWith("aiPageTranslatorCache:")
+      ),
+    "translation to be written to the persistent cache"
+  );
+
+  const second = createHarness({ html, storageStore: sharedStore });
+  t.after(second.close);
+  second.start();
+  const secondState = await waitForTerminalState(second);
+
+  assert.equal(secondState.status, "done", secondState.error);
+  assert.equal(
+    second.requestedSegments().length,
+    0,
+    "a cached translation should not trigger a new API request"
+  );
+  assert.match(second.document.querySelector("#para").textContent, /【译文:/);
+});
+
+test("skips content that already matches the target language without calling the backend", async (t) => {
+  const harness = createHarness({
+    html: `<main><p id="already-zh">这段内容已经是简体中文，不需要重新翻译。</p></main>`
+  });
+  t.after(harness.close);
+
+  harness.start({ targetLanguage: "zh-CN" });
+  const state = await waitForTerminalState(harness);
+
+  assert.equal(state.status, "done", state.error);
+  assert.equal(
+    harness.requestedSegments().length,
+    0,
+    "content already in the target language should not be sent for translation"
+  );
+  assert.equal(
+    harness.document.querySelectorAll(TRANSLATION_SELECTOR).length,
+    0
+  );
 });

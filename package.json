@@ -6,7 +6,8 @@
   "type": "module",
   "scripts": {
     "test": "node --test",
-    "check": "node --check src/background.js && node --check src/content.js && node --check src/popup/popup.js"
+    "check": "node --check src/background.js && node --check src/content.js && node --check src/popup/popup.js",
+    "sync-safari": "node scripts/sync-safari.mjs"
   },
   "devDependencies": {
     "jsdom": "^29.1.1"

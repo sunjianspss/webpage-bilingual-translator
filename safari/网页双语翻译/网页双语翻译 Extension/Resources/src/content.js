@@ -52,6 +52,7 @@
   };
   let taskGeneration = 0;
   let persistentCacheWriteChain = Promise.resolve();
+  const persistentCachePendingWrites = new Map();
   let activeSession = null;
   let pendingStartJobId = "";
 
@@ -348,6 +349,7 @@
       : [0];
     let foundCandidates = false;
 
+    let totalFailures = 0;
     try {
       for (const delay of rescanDelays) {
         if (delay > 0) {
@@ -356,25 +358,31 @@
         assertCurrentTask(taskId);
         const result = await translateCurrentCandidates(session);
         foundCandidates = foundCandidates || result.discovered > 0;
+        totalFailures += countFailedPlacements(result.failures);
       }
     } finally {
       session.initializing = false;
     }
 
+    const hasFailures = totalFailures > 0;
     state = {
       ...state,
-      status: "done",
+      status: hasFailures ? "error" : "done",
       translated: session.usedPlacements,
       total: session.usedPlacements,
-      error: ""
+      error: hasFailures ? `${totalFailures} 处内容翻译失败` : ""
     };
     showStatus(
-      foundCandidates
-        ? `已翻译 ${session.usedPlacements} 处内容`
-        : "暂未发现正文，正在监听动态内容",
-      "success"
+      hasFailures
+        ? `已翻译 ${session.usedPlacements} 处内容，${totalFailures} 处失败`
+        : foundCandidates
+          ? `已翻译 ${session.usedPlacements} 处内容`
+          : "暂未发现正文，正在监听动态内容",
+      hasFailures ? "error" : "success"
     );
-    scheduleStatusHide(session);
+    if (!hasFailures) {
+      scheduleStatusHide(session);
+    }
     if (session.rescanRequested) {
       session.rescanRequested = false;
       scheduleIncrementalScan(session, 0);
@@ -385,7 +393,7 @@
     assertCurrentTask(session.taskId);
     if (session.scanRunning) {
       session.rescanRequested = true;
-      return { discovered: 0 };
+      return { discovered: 0, failures: [] };
     }
 
     const remaining = session.maxPlacements - session.usedPlacements;
@@ -393,7 +401,7 @@
       remaining <= 0 &&
       session.pendingRetranslationTargets.size === 0
     ) {
-      return { discovered: 0 };
+      return { discovered: 0, failures: [] };
     }
 
     session.scanRunning = true;
@@ -408,7 +416,7 @@
       );
       let availableNewPlacements = remaining;
       const placements = collected.filter((placement) => {
-        if (session.countedTargets.has(placement.target)) {
+        if (session.countedTargets.has(placementIdentity(placement))) {
           return true;
         }
         if (availableNewPlacements <= 0) {
@@ -418,7 +426,7 @@
         return true;
       });
       if (placements.length === 0) {
-        return { discovered: 0 };
+        return { discovered: 0, failures: [] };
       }
 
       clearScheduledStatusHide(session);
@@ -429,13 +437,14 @@
           session.usedPlacements +
           placements.filter(
             (placement) =>
-              !session.countedTargets.has(placement.target)
+              !session.countedTargets.has(placementIdentity(placement))
           ).length,
         error: ""
       };
       showTranslationProgress(session);
 
       const groups = await groupCandidatePlacements(placements, session);
+      assertCurrentTask(session.taskId);
       for (const group of groups) {
         const cached = session.translationCache.get(group.key);
         if (cached) {
@@ -446,8 +455,9 @@
       const candidates = groups
         .filter((group) => !group.applied)
         .flatMap((group) => group.fragments);
+      let batchFailures = [];
       if (candidates.length > 0) {
-        await translateCandidateBatches(
+        batchFailures = await translateCandidateBatches(
           makeBatches(candidates, settings),
           getTranslationBatchConcurrency(settings),
           shouldWarmupFirstBatch(settings),
@@ -491,19 +501,27 @@
       }
 
       assertCurrentTask(session.taskId);
+      const failedPlacements = countFailedPlacements(batchFailures);
+      const hasFailures = failedPlacements > 0;
       state = {
         ...state,
-        status: "done",
+        status: hasFailures ? "error" : "done",
         translated: session.usedPlacements,
         total: session.usedPlacements,
-        error: ""
+        error: hasFailures
+          ? `${failedPlacements} 处内容翻译失败`
+          : ""
       };
       showStatus(
-        `已翻译 ${session.usedPlacements} 处内容`,
-        "success"
+        hasFailures
+          ? `已翻译 ${session.usedPlacements} 处内容，${failedPlacements} 处失败`
+          : `已翻译 ${session.usedPlacements} 处内容`,
+        hasFailures ? "error" : "success"
       );
-      scheduleStatusHide(session);
-      return { discovered: placements.length };
+      if (!hasFailures) {
+        scheduleStatusHide(session);
+      }
+      return { discovered: placements.length, failures: batchFailures };
     } finally {
       session.scanRunning = false;
     }
@@ -559,8 +577,9 @@
     let newPlacements = 0;
     withObserverPaused(session, () => {
       for (const placement of group.placements) {
+        const identity = placementIdentity(placement);
         const alreadyCounted = session.countedTargets.has(
-          placement.target
+          identity
         );
         if (
           !alreadyCounted &&
@@ -580,7 +599,7 @@
         ) {
           session.pendingRetranslationTargets.delete(placement.target);
           if (!alreadyCounted) {
-            session.countedTargets.add(placement.target);
+            session.countedTargets.add(identity);
             newPlacements += 1;
           }
         } else if (!placement.target.isConnected) {
@@ -592,6 +611,12 @@
     group.applied = true;
   }
 
+  function placementIdentity(placement) {
+    return placement.targetType === "flow"
+      ? placement.nodes?.[0] || placement.target
+      : placement.target;
+  }
+
   async function translateCandidateBatches(
     batches,
     concurrency,
@@ -600,22 +625,30 @@
     onBatchTranslated
   ) {
     let workerBatches = batches;
+    const failures = [];
     if (warmupFirstBatch && batches.length > 1) {
-      const response = await requestTranslationBatch(batches[0], taskId);
-      assertCurrentTask(taskId);
-      onBatchTranslated(batches[0], response);
+      try {
+        const response = await requestTranslationBatch(batches[0], taskId);
+        assertCurrentTask(taskId);
+        onBatchTranslated(batches[0], response);
+      } catch (error) {
+        if (isFatalBatchError(error)) {
+          throw error;
+        }
+        failures.push({ batch: batches[0], error });
+      }
       workerBatches = batches.slice(1);
     }
 
     let nextIndex = 0;
-    let firstError = null;
+    let fatalError = null;
     const workerCount = Math.min(
       concurrency,
       workerBatches.length
     );
 
     async function worker() {
-      while (!firstError) {
+      while (!fatalError) {
         const batch = workerBatches[nextIndex];
         nextIndex += 1;
         if (!batch) {
@@ -625,13 +658,16 @@
         try {
           const response = await requestTranslationBatch(batch, taskId);
           assertCurrentTask(taskId);
-          if (firstError) {
+          if (fatalError) {
             return;
           }
           onBatchTranslated(batch, response);
         } catch (error) {
-          firstError = firstError || error;
-          return;
+          if (isFatalBatchError(error)) {
+            fatalError = error;
+            return;
+          }
+          failures.push({ batch, error });
         }
       }
     }
@@ -639,9 +675,37 @@
     await Promise.all(
       Array.from({ length: workerCount }, () => worker())
     );
-    if (firstError) {
-      throw firstError;
+    if (fatalError) {
+      throw fatalError;
     }
+    return failures;
+  }
+
+  // 失败批次的数量不等于用户看到的失败条数：一个批次里可能有十几个
+  // 片段，多个片段又可能同属一段正文。这里按“最终没能落到页面上的
+  // 原文位置”计数，和“已翻译 N 处内容”用的是同一个单位。
+  function countFailedPlacements(failures) {
+    const failedGroups = new Set();
+    for (const failure of failures) {
+      for (const candidate of failure.batch) {
+        if (candidate.group && !candidate.group.applied) {
+          failedGroups.add(candidate.group);
+        }
+      }
+    }
+    let total = 0;
+    for (const group of failedGroups) {
+      total += group.placements.length;
+    }
+    return total;
+  }
+
+  function isFatalBatchError(error) {
+    return Boolean(
+      error?.canceled ||
+      error?.code === "TRANSLATION_CANCELED" ||
+      error?.code === "TRANSLATION_JOB_NOT_FOUND"
+    );
   }
 
   function getTranslationBatchConcurrency(settings) {
@@ -848,20 +912,31 @@
       session.settings.targetLanguage,
       groupKey
     );
+    // 整页翻译会产生上百次写入，逐条写会把整个索引数组（最多 3000 项）
+    // 反复读出再写回。这里先攒进待写队列：一次落盘进行中时新到的条目
+    // 会自动合并到下一次 flush，写入次数从“每条一次”降到“每轮一次”。
+    persistentCachePendingWrites.set(storageKey, translatedText);
     persistentCacheWriteChain = persistentCacheWriteChain
-      .then(() =>
-        writePersistentCacheEntry(storage, storageKey, translatedText)
-      )
+      .then(() => flushPersistentCacheWrites(storage))
       .catch(() => {});
   }
 
-  async function writePersistentCacheEntry(storage, storageKey, text) {
+  async function flushPersistentCacheWrites(storage) {
+    if (persistentCachePendingWrites.size === 0) {
+      return;
+    }
+    const entries = [...persistentCachePendingWrites];
+    persistentCachePendingWrites.clear();
+
     const indexResult = await storage.get(PERSISTENT_CACHE_INDEX_KEY);
     const index = Array.isArray(indexResult?.[PERSISTENT_CACHE_INDEX_KEY])
       ? indexResult[PERSISTENT_CACHE_INDEX_KEY]
       : [];
-    const nextIndex = index.filter((key) => key !== storageKey);
-    nextIndex.push(storageKey);
+    const writtenKeys = new Set(entries.map(([key]) => key));
+    const nextIndex = index.filter((key) => !writtenKeys.has(key));
+    for (const [key] of entries) {
+      nextIndex.push(key);
+    }
 
     const evicted = [];
     while (nextIndex.length > PERSISTENT_CACHE_MAX_ENTRIES) {
@@ -869,7 +944,7 @@
     }
 
     await storage.set({
-      [storageKey]: text,
+      ...Object.fromEntries(entries),
       [PERSISTENT_CACHE_INDEX_KEY]: nextIndex
     });
     if (evicted.length > 0) {
@@ -927,12 +1002,15 @@
         }
       }
     }
+    // 这两个列表在下面的逐元素循环里被反复扫描，先物化成数组，
+    // 避免每次迭代都重新展开 Set（大页面上会退化成平方级开销）。
+    const structuredTextList = [...structuredTextElements];
     const flowCandidates = useFocusedSocialExtraction
       ? []
       : roots.flatMap((root) =>
         collectFlowCandidates(root).filter(
           (candidate) =>
-            ![...structuredTextElements].some(
+            !structuredTextList.some(
               (element) =>
                 element === candidate.target ||
                 element.contains(candidate.target) ||
@@ -945,6 +1023,7 @@
         candidate.nodes.filter((node) => node.nodeType === Node.ELEMENT_NODE)
       )
     );
+    const flowElementList = [...flowElements];
     let candidates = [...flowCandidates];
 
     for (const element of elements) {
@@ -953,10 +1032,10 @@
       }
       if (
         flowElements.has(element) ||
-        [...flowElements].some((flowElement) =>
+        flowElementList.some((flowElement) =>
           flowElement.contains(element)
         ) ||
-        [...structuredTextElements].some(
+        structuredTextList.some(
           (structuredElement) =>
             structuredElement !== element &&
             structuredElement.contains(element)
@@ -1001,7 +1080,9 @@
     candidates = dedupeCandidatePlacements(
       removeAncestorConflicts(candidates)
     );
-    const candidateElements = candidates.map((item) => item.target);
+    const candidateElements = candidates
+      .filter((item) => item.targetType !== "flow")
+      .map((item) => item.target);
     const flowNodes = new Set(
       flowCandidates.flatMap((candidate) => candidate.nodes)
     );
@@ -1060,7 +1141,16 @@
 
   function dedupeCandidatePlacements(candidates) {
     const seenTargets = new Set();
+    const seenFlowStarts = new Set();
     return candidates.filter((candidate) => {
+      if (candidate.targetType === "flow") {
+        const firstNode = candidate.nodes?.[0];
+        if (!firstNode || seenFlowStarts.has(firstNode)) {
+          return false;
+        }
+        seenFlowStarts.add(firstNode);
+        return true;
+      }
       if (seenTargets.has(candidate.target)) {
         return false;
       }
@@ -1572,7 +1662,9 @@
     session.observer.observe(document.documentElement, {
       childList: true,
       subtree: true,
-      characterData: true
+      characterData: true,
+      attributes: true,
+      attributeFilter: ["class", "style", "hidden", "aria-hidden"]
     });
   }
 
@@ -1596,6 +1688,9 @@
       return false;
     }
     if (record.type === "characterData") {
+      return true;
+    }
+    if (record.type === "attributes") {
       return true;
     }
     const changedNodes = [

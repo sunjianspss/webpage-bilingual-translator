@@ -9,7 +9,9 @@ import {
 
 const TRANSLATE_COMMAND = "translate-current-page";
 const TRANSLATION_REQUEST_TIMEOUT_MS = 45_000;
+const TRANSLATION_JOB_STORAGE_PREFIX = "translatorTranslationJob:";
 const translationJobs = new Map();
+let translationJobStateQueue = Promise.resolve();
 const JOB_MESSAGE_TYPES = new Set([
   "CREATE_TRANSLATION_JOB",
   "TRANSLATE_BATCH",
@@ -42,43 +44,50 @@ chrome.commands?.onCommand?.addListener((command) => {
 });
 
 chrome.tabs?.onRemoved?.addListener?.((tabId) => {
-  disposeJobsForTab(tabId);
+  return disposeJobsForTab(tabId).catch(logJobCleanupError);
 });
 
 chrome.tabs?.onUpdated?.addListener?.((tabId, changeInfo) => {
   if (changeInfo?.status === "loading") {
-    disposeJobsForTab(tabId);
+    return disposeJobsForTab(tabId).catch(logJobCleanupError);
   }
 });
 
 chrome.tabs?.onReplaced?.addListener?.((_addedTabId, removedTabId) => {
-  disposeJobsForTab(removedTabId);
+  return disposeJobsForTab(removedTabId).catch(logJobCleanupError);
 });
 
 async function handleJobMessage(message, sender) {
   if (message.type === "CREATE_TRANSLATION_JOB") {
+    const job = await createTranslationJob(
+      message.settings,
+      message.tabId
+    );
     return {
       ok: true,
-      ...createTranslationJob(message.settings, message.tabId)
+      ...job
     };
   }
 
   if (message.type === "CANCEL_TRANSLATION_JOB") {
-    disposeTranslationJob(message.jobId);
+    await disposeTranslationJob(message.jobId);
     return { ok: true, canceled: true };
   }
 
   if (message.type === "RELEASE_TRANSLATION_JOB") {
-    disposeTranslationJob(message.jobId);
+    await disposeTranslationJob(message.jobId);
     return { ok: true };
   }
 
-  const job = getTranslationJob(message.jobId, sender?.tab?.id);
+  const job = await getTranslationJob(
+    message.jobId,
+    sender?.tab?.id
+  );
   const translations = await translateBatch(message.segments, job);
   return { ok: true, translations };
 }
 
-function createTranslationJob(settings, tabId) {
+async function createTranslationJob(settings, tabId) {
   if (!settings || typeof settings !== "object") {
     throw codedError(
       "创建翻译任务时缺少设置",
@@ -91,15 +100,22 @@ function createTranslationJob(settings, tabId) {
     ...settings
   });
   const jobId = createJobId();
-  translationJobs.set(jobId, {
-    settings: snapshot,
-    controller: new AbortController(),
-    tabId: Number.isInteger(tabId) ? tabId : null
+  const job = createRuntimeTranslationJob(snapshot, tabId);
+
+  return withTranslationJobState(async () => {
+    translationJobs.set(jobId, job);
+    try {
+      await persistTranslationJob(jobId, job);
+    } catch (error) {
+      translationJobs.delete(jobId);
+      job.controller.abort();
+      throw error;
+    }
+    return {
+      jobId,
+      pageSettings: pageSettings(snapshot)
+    };
   });
-  return {
-    jobId,
-    pageSettings: pageSettings(snapshot)
-  };
 }
 
 function createJobId() {
@@ -107,43 +123,190 @@ function createJobId() {
     `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
-function getTranslationJob(jobId, senderTabId) {
-  const job = translationJobs.get(jobId);
-  if (!job) {
-    throw canceledError(
-      "翻译任务不存在或已结束",
-      "TRANSLATION_JOB_NOT_FOUND"
-    );
-  }
-  if (job.controller.signal.aborted) {
-    throw canceledError();
-  }
-  if (job.tabId !== null && senderTabId !== job.tabId) {
-    throw codedError(
-      "翻译任务与当前页面不匹配",
-      "TRANSLATION_JOB_TAB_MISMATCH"
-    );
-  }
-  return job;
+async function getTranslationJob(jobId, senderTabId) {
+  return withTranslationJobState(async () => {
+    let job = translationJobs.get(jobId);
+    if (!job) {
+      const persisted = await readPersistedTranslationJob(jobId);
+      if (persisted) {
+        job = createRuntimeTranslationJob(
+          persisted.settings,
+          persisted.tabId
+        );
+        translationJobs.set(jobId, job);
+      }
+    }
+    if (!job) {
+      throw canceledError(
+        "翻译任务不存在或已结束",
+        "TRANSLATION_JOB_NOT_FOUND"
+      );
+    }
+    if (job.controller.signal.aborted) {
+      throw canceledError();
+    }
+    if (job.tabId !== null && senderTabId !== job.tabId) {
+      throw codedError(
+        "翻译任务与当前页面不匹配",
+        "TRANSLATION_JOB_TAB_MISMATCH"
+      );
+    }
+    return job;
+  });
 }
 
-function disposeTranslationJob(jobId) {
+async function disposeTranslationJob(jobId) {
+  return withTranslationJobState(async () => {
+    abortInMemoryTranslationJob(jobId);
+    await removePersistedTranslationJobs([jobId]);
+  });
+}
+
+async function disposeJobsForTab(tabId) {
+  return withTranslationJobState(async () => {
+    const jobIds = new Set();
+    for (const [jobId, job] of translationJobs) {
+      if (job.tabId === tabId) {
+        jobIds.add(jobId);
+      }
+    }
+    for (const persisted of await readAllPersistedTranslationJobs()) {
+      if (persisted.tabId === tabId) {
+        jobIds.add(persisted.jobId);
+      }
+    }
+    for (const jobId of jobIds) {
+      abortInMemoryTranslationJob(jobId);
+    }
+    await removePersistedTranslationJobs([...jobIds]);
+  });
+}
+
+function createRuntimeTranslationJob(settings, tabId) {
+  return {
+    settings: Object.freeze({
+      ...DEFAULT_SETTINGS,
+      ...settings
+    }),
+    controller: new AbortController(),
+    tabId: Number.isInteger(tabId) ? tabId : null
+  };
+}
+
+function abortInMemoryTranslationJob(jobId) {
   const job = translationJobs.get(jobId);
-  if (!job) {
-    return;
-  }
   translationJobs.delete(jobId);
-  if (!job.controller.signal.aborted) {
+  if (job && !job.controller.signal.aborted) {
     job.controller.abort();
   }
 }
 
-function disposeJobsForTab(tabId) {
-  for (const [jobId, job] of translationJobs) {
-    if (job.tabId === tabId) {
-      disposeTranslationJob(jobId);
-    }
+function withTranslationJobState(operation) {
+  const result = translationJobStateQueue.then(operation, operation);
+  translationJobStateQueue = result.then(
+    () => undefined,
+    () => undefined
+  );
+  return result;
+}
+
+function translationJobStorage() {
+  const storage = chrome.storage?.session;
+  if (
+    !storage ||
+    typeof storage.get !== "function" ||
+    typeof storage.set !== "function" ||
+    typeof storage.remove !== "function"
+  ) {
+    return null;
   }
+  return storage;
+}
+
+function translationJobStorageKey(jobId) {
+  return `${TRANSLATION_JOB_STORAGE_PREFIX}${jobId}`;
+}
+
+async function persistTranslationJob(jobId, job) {
+  const storage = translationJobStorage();
+  if (!storage) {
+    return;
+  }
+  await storage.set({
+    [translationJobStorageKey(jobId)]: {
+      version: 1,
+      jobId,
+      tabId: job.tabId,
+      settings: { ...job.settings }
+    }
+  });
+}
+
+async function readPersistedTranslationJob(jobId) {
+  const storage = translationJobStorage();
+  if (!storage) {
+    return null;
+  }
+  const key = translationJobStorageKey(jobId);
+  const stored = await storage.get(key);
+  const record = normalizePersistedTranslationJob(stored[key], jobId);
+  if (!record && key in stored) {
+    await storage.remove(key);
+  }
+  return record;
+}
+
+async function readAllPersistedTranslationJobs() {
+  const storage = translationJobStorage();
+  if (!storage) {
+    return [];
+  }
+  const stored = await storage.get(null);
+  return Object.entries(stored)
+    .filter(([key]) => key.startsWith(TRANSLATION_JOB_STORAGE_PREFIX))
+    .map(([key, value]) =>
+      normalizePersistedTranslationJob(
+        value,
+        key.slice(TRANSLATION_JOB_STORAGE_PREFIX.length)
+      )
+    )
+    .filter(Boolean);
+}
+
+function normalizePersistedTranslationJob(record, jobId) {
+  if (
+    !record ||
+    record.version !== 1 ||
+    record.jobId !== jobId ||
+    !record.settings ||
+    typeof record.settings !== "object" ||
+    !(record.tabId === null || Number.isInteger(record.tabId))
+  ) {
+    return null;
+  }
+  return {
+    jobId,
+    tabId: record.tabId,
+    settings: Object.freeze({
+      ...DEFAULT_SETTINGS,
+      ...record.settings
+    })
+  };
+}
+
+async function removePersistedTranslationJobs(jobIds) {
+  const storage = translationJobStorage();
+  if (!storage || jobIds.length === 0) {
+    return;
+  }
+  await storage.remove(jobIds.map(translationJobStorageKey));
+}
+
+function logJobCleanupError(error) {
+  console.warn(
+    "无法清理翻译任务",
+    error instanceof Error ? error.message : error
+  );
 }
 
 async function translateBatch(segments, job) {
@@ -169,7 +332,7 @@ async function translateActiveTabFromCommand() {
     target: { tabId: tab.id },
     files: ["src/content.js"]
   });
-  const job = createTranslationJob(
+  const job = await createTranslationJob(
     await loadTranslatorSettings(),
     tab.id
   );
@@ -183,7 +346,7 @@ async function translateActiveTabFromCommand() {
       throw new Error(response?.error || "翻译失败");
     }
   } catch (error) {
-    disposeTranslationJob(job.jobId);
+    await disposeTranslationJob(job.jobId);
     throw error;
   }
 }

@@ -31,12 +31,15 @@
         }
       }
     }
+    // 这两个列表在下面的逐元素循环里被反复扫描，先物化成数组，
+    // 避免每次迭代都重新展开 Set（大页面上会退化成平方级开销）。
+    const structuredTextList = [...structuredTextElements];
     const flowCandidates = useFocusedSocialExtraction
       ? []
       : roots.flatMap((root) =>
         collectFlowCandidates(root).filter(
           (candidate) =>
-            ![...structuredTextElements].some(
+            !structuredTextList.some(
               (element) =>
                 element === candidate.target ||
                 element.contains(candidate.target) ||
@@ -49,6 +52,7 @@
         candidate.nodes.filter((node) => node.nodeType === Node.ELEMENT_NODE)
       )
     );
+    const flowElementList = [...flowElements];
     let candidates = [...flowCandidates];
 
     for (const element of elements) {
@@ -57,10 +61,10 @@
       }
       if (
         flowElements.has(element) ||
-        [...flowElements].some((flowElement) =>
+        flowElementList.some((flowElement) =>
           flowElement.contains(element)
         ) ||
-        [...structuredTextElements].some(
+        structuredTextList.some(
           (structuredElement) =>
             structuredElement !== element &&
             structuredElement.contains(element)
@@ -105,7 +109,9 @@
     candidates = dedupeCandidatePlacements(
       removeAncestorConflicts(candidates)
     );
-    const candidateElements = candidates.map((item) => item.target);
+    const candidateElements = candidates
+      .filter((item) => item.targetType !== "flow")
+      .map((item) => item.target);
     const flowNodes = new Set(
       flowCandidates.flatMap((candidate) => candidate.nodes)
     );
@@ -164,7 +170,16 @@
 
   function dedupeCandidatePlacements(candidates) {
     const seenTargets = new Set();
+    const seenFlowStarts = new Set();
     return candidates.filter((candidate) => {
+      if (candidate.targetType === "flow") {
+        const firstNode = candidate.nodes?.[0];
+        if (!firstNode || seenFlowStarts.has(firstNode)) {
+          return false;
+        }
+        seenFlowStarts.add(firstNode);
+        return true;
+      }
       if (seenTargets.has(candidate.target)) {
         return false;
       }

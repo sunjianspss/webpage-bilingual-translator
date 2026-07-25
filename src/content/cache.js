@@ -100,20 +100,31 @@
       session.settings.targetLanguage,
       groupKey
     );
+    // 整页翻译会产生上百次写入，逐条写会把整个索引数组（最多 3000 项）
+    // 反复读出再写回。这里先攒进待写队列：一次落盘进行中时新到的条目
+    // 会自动合并到下一次 flush，写入次数从“每条一次”降到“每轮一次”。
+    persistentCachePendingWrites.set(storageKey, translatedText);
     persistentCacheWriteChain = persistentCacheWriteChain
-      .then(() =>
-        writePersistentCacheEntry(storage, storageKey, translatedText)
-      )
+      .then(() => flushPersistentCacheWrites(storage))
       .catch(() => {});
   }
 
-  async function writePersistentCacheEntry(storage, storageKey, text) {
+  async function flushPersistentCacheWrites(storage) {
+    if (persistentCachePendingWrites.size === 0) {
+      return;
+    }
+    const entries = [...persistentCachePendingWrites];
+    persistentCachePendingWrites.clear();
+
     const indexResult = await storage.get(PERSISTENT_CACHE_INDEX_KEY);
     const index = Array.isArray(indexResult?.[PERSISTENT_CACHE_INDEX_KEY])
       ? indexResult[PERSISTENT_CACHE_INDEX_KEY]
       : [];
-    const nextIndex = index.filter((key) => key !== storageKey);
-    nextIndex.push(storageKey);
+    const writtenKeys = new Set(entries.map(([key]) => key));
+    const nextIndex = index.filter((key) => !writtenKeys.has(key));
+    for (const [key] of entries) {
+      nextIndex.push(key);
+    }
 
     const evicted = [];
     while (nextIndex.length > PERSISTENT_CACHE_MAX_ENTRIES) {
@@ -121,7 +132,7 @@
     }
 
     await storage.set({
-      [storageKey]: text,
+      ...Object.fromEntries(entries),
       [PERSISTENT_CACHE_INDEX_KEY]: nextIndex
     });
     if (evicted.length > 0) {

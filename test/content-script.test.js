@@ -224,6 +224,29 @@ test("popup includes shortcut customization controls", async () => {
   assert.match(popup, /chrome\.tabs\.create\(\{ url: SHORTCUTS_URL \}\)/);
 });
 
+test("popup follows translation progress instead of freezing at the first reply", async () => {
+  const popup = await readFile(chromePopupUrl, "utf8");
+
+  assert.match(popup, /const PROGRESS_POLL_INTERVAL_MS = \d+/);
+  assert.match(popup, /function startProgressPolling\(\)/);
+  assert.match(popup, /function stopProgressPolling\(\)/);
+  assert.match(
+    popup,
+    /window\.setInterval\(/,
+    "progress must be re-read on a timer, the first reply is always 0 / 0"
+  );
+  assert.match(
+    popup,
+    /sendToPage\(\{ type: "GET_PAGE_STATE" \}\)/,
+    "the poll has to ask the page for its current state"
+  );
+  assert.match(
+    popup,
+    /if \(pageState\.status === "translating"\) \{\s*startProgressPolling\(\);\s*\} else \{\s*stopProgressPolling\(\);\s*\}/,
+    "polling must start while translating and stop on every terminal state"
+  );
+});
+
 test("popup offers a clear-cache retranslate action", async () => {
   const [html, popup, content] = await Promise.all([
     readFile(chromePopupHtmlUrl, "utf8"),
@@ -266,6 +289,30 @@ test("manifest defines a shortcut command for translating the current page", asy
     mac: "Command+Shift+Y"
   });
   assert.deepEqual(safariCommand, chromeCommand);
+});
+
+test("both manifests ship toolbar and store icons", async () => {
+  const [chromeManifest, safariManifest] = await Promise.all([
+    readFile(chromeManifestUrl, "utf8").then(JSON.parse),
+    readFile(safariManifestUrl, "utf8").then(JSON.parse)
+  ]);
+  const expected = {
+    16: "icons/icon-16.png",
+    32: "icons/icon-32.png",
+    48: "icons/icon-48.png",
+    128: "icons/icon-128.png"
+  };
+
+  assert.deepEqual(chromeManifest.icons, expected);
+  assert.deepEqual(chromeManifest.action.default_icon, expected);
+  assert.deepEqual(safariManifest.icons, expected);
+  assert.deepEqual(safariManifest.action.default_icon, expected);
+
+  await Promise.all(
+    Object.values(expected).map((relativePath) =>
+      readFile(new URL(`../${relativePath}`, import.meta.url))
+    )
+  );
 });
 
 test("background shortcut command injects the content script and starts translation", async () => {

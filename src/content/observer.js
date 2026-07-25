@@ -33,7 +33,9 @@
     session.observer.observe(document.documentElement, {
       childList: true,
       subtree: true,
-      characterData: true
+      characterData: true,
+      attributes: true,
+      attributeFilter: ["class", "style", "hidden", "aria-hidden"]
     });
   }
 
@@ -57,6 +59,9 @@
       return false;
     }
     if (record.type === "characterData") {
+      return true;
+    }
+    if (record.type === "attributes") {
       return true;
     }
     const changedNodes = [

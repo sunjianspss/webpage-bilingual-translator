@@ -5,6 +5,7 @@
       : [0];
     let foundCandidates = false;
 
+    let totalFailures = 0;
     try {
       for (const delay of rescanDelays) {
         if (delay > 0) {
@@ -13,25 +14,31 @@
         assertCurrentTask(taskId);
         const result = await translateCurrentCandidates(session);
         foundCandidates = foundCandidates || result.discovered > 0;
+        totalFailures += countFailedPlacements(result.failures);
       }
     } finally {
       session.initializing = false;
     }
 
+    const hasFailures = totalFailures > 0;
     state = {
       ...state,
-      status: "done",
+      status: hasFailures ? "error" : "done",
       translated: session.usedPlacements,
       total: session.usedPlacements,
-      error: ""
+      error: hasFailures ? `${totalFailures} 处内容翻译失败` : ""
     };
     showStatus(
-      foundCandidates
-        ? `已翻译 ${session.usedPlacements} 处内容`
-        : "暂未发现正文，正在监听动态内容",
-      "success"
+      hasFailures
+        ? `已翻译 ${session.usedPlacements} 处内容，${totalFailures} 处失败`
+        : foundCandidates
+          ? `已翻译 ${session.usedPlacements} 处内容`
+          : "暂未发现正文，正在监听动态内容",
+      hasFailures ? "error" : "success"
     );
-    scheduleStatusHide(session);
+    if (!hasFailures) {
+      scheduleStatusHide(session);
+    }
     if (session.rescanRequested) {
       session.rescanRequested = false;
       scheduleIncrementalScan(session, 0);
@@ -42,7 +49,7 @@
     assertCurrentTask(session.taskId);
     if (session.scanRunning) {
       session.rescanRequested = true;
-      return { discovered: 0 };
+      return { discovered: 0, failures: [] };
     }
 
     const remaining = session.maxPlacements - session.usedPlacements;
@@ -50,7 +57,7 @@
       remaining <= 0 &&
       session.pendingRetranslationTargets.size === 0
     ) {
-      return { discovered: 0 };
+      return { discovered: 0, failures: [] };
     }
 
     session.scanRunning = true;
@@ -65,7 +72,7 @@
       );
       let availableNewPlacements = remaining;
       const placements = collected.filter((placement) => {
-        if (session.countedTargets.has(placement.target)) {
+        if (session.countedTargets.has(placementIdentity(placement))) {
           return true;
         }
         if (availableNewPlacements <= 0) {
@@ -75,7 +82,7 @@
         return true;
       });
       if (placements.length === 0) {
-        return { discovered: 0 };
+        return { discovered: 0, failures: [] };
       }
 
       clearScheduledStatusHide(session);
@@ -86,13 +93,14 @@
           session.usedPlacements +
           placements.filter(
             (placement) =>
-              !session.countedTargets.has(placement.target)
+              !session.countedTargets.has(placementIdentity(placement))
           ).length,
         error: ""
       };
       showTranslationProgress(session);
 
       const groups = await groupCandidatePlacements(placements, session);
+      assertCurrentTask(session.taskId);
       for (const group of groups) {
         const cached = session.translationCache.get(group.key);
         if (cached) {
@@ -103,8 +111,9 @@
       const candidates = groups
         .filter((group) => !group.applied)
         .flatMap((group) => group.fragments);
+      let batchFailures = [];
       if (candidates.length > 0) {
-        await translateCandidateBatches(
+        batchFailures = await translateCandidateBatches(
           makeBatches(candidates, settings),
           getTranslationBatchConcurrency(settings),
           shouldWarmupFirstBatch(settings),
@@ -148,19 +157,27 @@
       }
 
       assertCurrentTask(session.taskId);
+      const failedPlacements = countFailedPlacements(batchFailures);
+      const hasFailures = failedPlacements > 0;
       state = {
         ...state,
-        status: "done",
+        status: hasFailures ? "error" : "done",
         translated: session.usedPlacements,
         total: session.usedPlacements,
-        error: ""
+        error: hasFailures
+          ? `${failedPlacements} 处内容翻译失败`
+          : ""
       };
       showStatus(
-        `已翻译 ${session.usedPlacements} 处内容`,
-        "success"
+        hasFailures
+          ? `已翻译 ${session.usedPlacements} 处内容，${failedPlacements} 处失败`
+          : `已翻译 ${session.usedPlacements} 处内容`,
+        hasFailures ? "error" : "success"
       );
-      scheduleStatusHide(session);
-      return { discovered: placements.length };
+      if (!hasFailures) {
+        scheduleStatusHide(session);
+      }
+      return { discovered: placements.length, failures: batchFailures };
     } finally {
       session.scanRunning = false;
     }
@@ -216,8 +233,9 @@
     let newPlacements = 0;
     withObserverPaused(session, () => {
       for (const placement of group.placements) {
+        const identity = placementIdentity(placement);
         const alreadyCounted = session.countedTargets.has(
-          placement.target
+          identity
         );
         if (
           !alreadyCounted &&
@@ -237,7 +255,7 @@
         ) {
           session.pendingRetranslationTargets.delete(placement.target);
           if (!alreadyCounted) {
-            session.countedTargets.add(placement.target);
+            session.countedTargets.add(identity);
             newPlacements += 1;
           }
         } else if (!placement.target.isConnected) {
@@ -249,6 +267,12 @@
     group.applied = true;
   }
 
+  function placementIdentity(placement) {
+    return placement.targetType === "flow"
+      ? placement.nodes?.[0] || placement.target
+      : placement.target;
+  }
+
   async function translateCandidateBatches(
     batches,
     concurrency,
@@ -257,22 +281,30 @@
     onBatchTranslated
   ) {
     let workerBatches = batches;
+    const failures = [];
     if (warmupFirstBatch && batches.length > 1) {
-      const response = await requestTranslationBatch(batches[0], taskId);
-      assertCurrentTask(taskId);
-      onBatchTranslated(batches[0], response);
+      try {
+        const response = await requestTranslationBatch(batches[0], taskId);
+        assertCurrentTask(taskId);
+        onBatchTranslated(batches[0], response);
+      } catch (error) {
+        if (isFatalBatchError(error)) {
+          throw error;
+        }
+        failures.push({ batch: batches[0], error });
+      }
       workerBatches = batches.slice(1);
     }
 
     let nextIndex = 0;
-    let firstError = null;
+    let fatalError = null;
     const workerCount = Math.min(
       concurrency,
       workerBatches.length
     );
 
     async function worker() {
-      while (!firstError) {
+      while (!fatalError) {
         const batch = workerBatches[nextIndex];
         nextIndex += 1;
         if (!batch) {
@@ -282,13 +314,16 @@
         try {
           const response = await requestTranslationBatch(batch, taskId);
           assertCurrentTask(taskId);
-          if (firstError) {
+          if (fatalError) {
             return;
           }
           onBatchTranslated(batch, response);
         } catch (error) {
-          firstError = firstError || error;
-          return;
+          if (isFatalBatchError(error)) {
+            fatalError = error;
+            return;
+          }
+          failures.push({ batch, error });
         }
       }
     }
@@ -296,9 +331,37 @@
     await Promise.all(
       Array.from({ length: workerCount }, () => worker())
     );
-    if (firstError) {
-      throw firstError;
+    if (fatalError) {
+      throw fatalError;
     }
+    return failures;
+  }
+
+  // 失败批次的数量不等于用户看到的失败条数：一个批次里可能有十几个
+  // 片段，多个片段又可能同属一段正文。这里按“最终没能落到页面上的
+  // 原文位置”计数，和“已翻译 N 处内容”用的是同一个单位。
+  function countFailedPlacements(failures) {
+    const failedGroups = new Set();
+    for (const failure of failures) {
+      for (const candidate of failure.batch) {
+        if (candidate.group && !candidate.group.applied) {
+          failedGroups.add(candidate.group);
+        }
+      }
+    }
+    let total = 0;
+    for (const group of failedGroups) {
+      total += group.placements.length;
+    }
+    return total;
+  }
+
+  function isFatalBatchError(error) {
+    return Boolean(
+      error?.canceled ||
+      error?.code === "TRANSLATION_CANCELED" ||
+      error?.code === "TRANSLATION_JOB_NOT_FOUND"
+    );
   }
 
   function getTranslationBatchConcurrency(settings) {

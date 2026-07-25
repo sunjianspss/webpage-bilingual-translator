@@ -13,6 +13,7 @@ let fetchMode = "success";
 let fetchStarted;
 let resolveFetchStarted;
 const requests = [];
+const sessionStorageState = {};
 
 globalThis.chrome = {
   runtime: {
@@ -32,6 +33,29 @@ globalThis.chrome = {
       async get() {
         storageReads += 1;
         return { translatorSettings: storedSettings };
+      }
+    },
+    session: {
+      async get(keys) {
+        if (keys === null || keys === undefined) {
+          return structuredClone(sessionStorageState);
+        }
+        const requestedKeys = Array.isArray(keys) ? keys : [keys];
+        return Object.fromEntries(
+          requestedKeys
+            .filter((key) => key in sessionStorageState)
+            .map((key) => [key, structuredClone(sessionStorageState[key])])
+        );
+      },
+      async set(values) {
+        for (const [key, value] of Object.entries(values)) {
+          sessionStorageState[key] = structuredClone(value);
+        }
+      },
+      async remove(keys) {
+        for (const key of Array.isArray(keys) ? keys : [keys]) {
+          delete sessionStorageState[key];
+        }
       }
     }
   },
@@ -138,6 +162,12 @@ function waitForNextFetch() {
   return fetchStarted;
 }
 
+function hasPersistedJob(jobId) {
+  return Object.keys(sessionStorageState).some((key) =>
+    key.endsWith(jobId)
+  );
+}
+
 test("translation jobs snapshot settings and keep secrets out of page settings", async () => {
   const suppliedSettings = translatorSettings();
   const created = await dispatch({
@@ -204,6 +234,7 @@ test("translation jobs snapshot settings and keep secrets out of page settings",
     jobId: created.jobId
   });
   assert.equal(released.ok, true);
+  assert.equal(hasPersistedJob(created.jobId), false);
 
   const afterRelease = await dispatch({
     type: "TRANSLATE_BATCH",
@@ -241,6 +272,7 @@ test("canceling a job aborts its in-flight fetch and returns a structured error"
     jobId: created.jobId
   });
   assert.deepEqual(canceled, { ok: true, canceled: true });
+  assert.equal(hasPersistedJob(created.jobId), false);
   assert.equal(fetchSignal.aborted, true);
   assert.deepEqual(await batchResponse, {
     ok: false,
@@ -274,6 +306,7 @@ test("releasing a job also aborts and deletes any in-flight work", async () => {
     jobId: created.jobId
   });
   assert.deepEqual(released, { ok: true });
+  assert.equal(hasPersistedJob(created.jobId), false);
   assert.equal(fetchSignal.aborted, true);
   assert.deepEqual(await batchResponse, {
     ok: false,
@@ -307,6 +340,7 @@ test("closing a bound tab disposes its translation jobs", async () => {
     code: "TRANSLATION_JOB_NOT_FOUND",
     error: "翻译任务不存在或已结束"
   });
+  assert.equal(hasPersistedJob(created.jobId), false);
 });
 
 test("translation requests fail with a finite timeout", async () => {
@@ -341,4 +375,48 @@ test("translation requests fail with a finite timeout", async () => {
     globalThis.setTimeout = originalSetTimeout;
     fetchMode = "success";
   }
+});
+
+test("translation jobs survive an MV3 service-worker restart", async () => {
+  const created = await dispatch({
+    type: "CREATE_TRANSLATION_JOB",
+    settings: translatorSettings({
+      localModel: "persisted-model",
+      localApiKey: "persisted-secret"
+    }),
+    tabId: 31
+  });
+
+  assert.equal(created.ok, true);
+  assert.equal(hasPersistedJob(created.jobId), true);
+
+  await import(`../src/background.js?job-restart=${Date.now()}`);
+
+  const translated = await dispatch(
+    {
+      type: "TRANSLATE_BATCH",
+      jobId: created.jobId,
+      segments: [{ id: "after-restart", text: "Hello" }]
+    },
+    { tab: { id: 31 } }
+  );
+
+  assert.deepEqual(translated, {
+    ok: true,
+    translations: { "after-restart": "译文" }
+  });
+  const request = requests.at(-1);
+  const body = JSON.parse(request.options.body);
+  assert.equal(body.model, "persisted-model");
+  assert.equal(
+    request.options.headers.Authorization,
+    "Bearer persisted-secret"
+  );
+
+  const released = await dispatch({
+    type: "RELEASE_TRANSLATION_JOB",
+    jobId: created.jobId
+  });
+  assert.deepEqual(released, { ok: true });
+  assert.equal(hasPersistedJob(created.jobId), false);
 });

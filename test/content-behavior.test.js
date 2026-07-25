@@ -55,7 +55,8 @@ function createHarness({
   html,
   url = "https://example.com/article",
   translate = successfulTranslation,
-  storageStore = {}
+  storageStore = {},
+  storageLocal
 }) {
   const dom = new JSDOM(html, {
     url,
@@ -105,7 +106,7 @@ function createHarness({
       }
     },
     storage: {
-      local: createStorageLocalMock(storageStore)
+      local: storageLocal || createStorageLocalMock(storageStore)
     }
   };
 
@@ -175,7 +176,7 @@ async function waitFor(predicate, description, timeout = 800) {
   throw new Error(`Timed out waiting for ${description}`);
 }
 
-async function waitForTerminalState(harness) {
+async function waitForTerminalState(harness, timeout = 800) {
   return waitFor(
     () => {
       const state = harness.state();
@@ -183,7 +184,8 @@ async function waitForTerminalState(harness) {
         ? state
         : null;
     },
-    "translation to finish"
+    "translation to finish",
+    timeout
   );
 }
 
@@ -291,6 +293,47 @@ test("splits and translates long direct text without a paragraph wrapper", async
   for (const segment of segments) {
     assert.ok(renderedText.includes(translationToken(segment)));
   }
+});
+
+test("translates every mixed flow and uncovered text in one article container", async (t) => {
+  const plainFirst =
+    "A plain article paragraph appears before any inline link in this section.";
+  const linkedFirst =
+    "The first mixed paragraph points to a reference and keeps its trailing explanation.";
+  const plainSecond =
+    "Another plain paragraph must not be hidden by a neighboring flow candidate.";
+  const linkedSecond =
+    "The second mixed paragraph uses a different link in the same parent container.";
+  const harness = createHarness({
+    html: `
+      <main>
+        <div id="wowhead-like-article">
+          ${plainFirst}<br><br>
+          The first mixed paragraph points to <a href="#first">a reference</a> and keeps its trailing explanation.<br><br>
+          ${plainSecond}<br><br>
+          The second mixed paragraph uses <a href="#second">a different link</a> in the same parent container.
+        </div>
+      </main>
+    `
+  });
+  t.after(harness.close);
+
+  harness.start();
+  const state = await waitForTerminalState(harness);
+  const requestedTexts = harness.requestedSegments().map(({ text }) => text);
+
+  assert.equal(state.status, "done", state.error);
+  assert.equal(state.translated, 4, "each logical paragraph counts as one placement");
+  assert.equal(
+    harness.document.querySelectorAll(TRANSLATION_SELECTOR).length,
+    4
+  );
+  assert.deepEqual(new Set(requestedTexts), new Set([
+    plainFirst,
+    linkedFirst,
+    plainSecond,
+    linkedSecond
+  ]));
 });
 
 test("keeps meaningful one- and two-character paragraph text", async (t) => {
@@ -513,6 +556,89 @@ test("RESTORE_PAGE cancels backend work and restores partially translated DOM", 
   assert.equal(harness.state().status, "idle");
 });
 
+test("RESTORE_PAGE cannot be undone by a late persistent-cache read", async (t) => {
+  const html = `<main><p id="cached">A late cache read must not restore translation after cancellation.</p></main>`;
+  const sharedStore = {};
+  const first = createHarness({ html, storageStore: sharedStore });
+  t.after(first.close);
+  first.start();
+  const firstState = await waitForTerminalState(first);
+  assert.equal(firstState.status, "done", firstState.error);
+  await waitFor(
+    () =>
+      Object.keys(sharedStore).some((key) =>
+        key.startsWith("aiPageTranslatorCache:")
+      ),
+    "the cached translation to be persisted"
+  );
+
+  const baseStorage = createStorageLocalMock(sharedStore);
+  let releaseCacheRead;
+  const cacheReadGate = new Promise((resolve) => {
+    releaseCacheRead = resolve;
+  });
+  let cacheReadStarted;
+  const cacheReadStart = new Promise((resolve) => {
+    cacheReadStarted = resolve;
+  });
+  const second = createHarness({
+    html,
+    storageLocal: {
+      ...baseStorage,
+      async get(keys) {
+        if (
+          Array.isArray(keys) &&
+          keys.some((key) => key.startsWith("aiPageTranslatorCache:"))
+        ) {
+          cacheReadStarted();
+          await cacheReadGate;
+        }
+        return baseStorage.get(keys);
+      }
+    }
+  });
+  t.after(second.close);
+
+  second.start();
+  await cacheReadStart;
+  second.dispatch({ type: "RESTORE_PAGE" });
+  releaseCacheRead();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  assert.equal(second.state().status, "idle");
+  assert.equal(second.requestedSegments().length, 0);
+  assert.equal(
+    second.document.querySelectorAll(TRANSLATION_SELECTOR).length,
+    0,
+    "a cache result arriving after cancellation must not mutate the DOM"
+  );
+});
+
+test("translates existing content when a SPA reveals it by attribute", async (t) => {
+  const text = "This paragraph becomes visible without being inserted again.";
+  const harness = createHarness({
+    html: `<main><p id="revealed" hidden>${text}</p></main>`
+  });
+  t.after(harness.close);
+
+  harness.start();
+  const initialState = await waitForTerminalState(harness);
+  assert.equal(initialState.status, "done", initialState.error);
+  assert.equal(harness.requestedSegments().length, 0);
+
+  const paragraph = harness.document.querySelector("#revealed");
+  paragraph.removeAttribute("hidden");
+
+  await waitFor(
+    () => paragraph.textContent.includes("【译文:"),
+    "attribute-revealed content to be translated",
+    1200
+  );
+  assert.ok(
+    harness.requestedSegments().some((segment) => segment.text === text)
+  );
+});
+
 test("translations persist across a page reload via chrome.storage.local", async (t) => {
   const html = `<main><p id="para">A persistent cache should avoid retranslating this exact paragraph text.</p></main>`;
   const sharedStore = {};
@@ -629,5 +755,154 @@ test("skips content that already matches the target language without calling the
   assert.equal(
     harness.document.querySelectorAll(TRANSLATION_SELECTOR).length,
     0
+  );
+});
+
+test("a failed batch reports every paragraph it lost, not just one", async (t) => {
+  const paragraphs = [
+    "Alpha squad ships reliable production software every single day.",
+    "Beta squad reviews every incident with careful attention to detail.",
+    "Gamma squad maintains the release pipeline without any manual steps.",
+    "Delta squad keeps the documentation aligned with the shipped build."
+  ];
+  const harness = createHarness({
+    html: `<main>${paragraphs
+      .map((text, index) => `<p id="p-${index}">${text}</p>`)
+      .join("")}</main>`,
+    translate: () => ({
+      ok: false,
+      error: "模型返回缺少 translations 数组",
+      code: "MODEL_OUTPUT"
+    })
+  });
+  t.after(harness.close);
+
+  harness.start();
+  const state = await waitForTerminalState(harness, 3000);
+
+  assert.equal(state.status, "error");
+  const batches = harness.runtimeMessages.filter(
+    (message) => message?.type === "TRANSLATE_BATCH"
+  );
+  assert.ok(
+    batches.every((message) => message.segments.length > 1),
+    "the paragraphs should share a batch, otherwise this test proves nothing"
+  );
+  assert.match(
+    state.error,
+    new RegExp(`^${paragraphs.length} 处内容翻译失败$`),
+    "the count must be the number of untranslated paragraphs, not failed batches"
+  );
+});
+
+test("caching a page writes the cache index far fewer times than it has entries", async (t) => {
+  const paragraphs = Array.from(
+    { length: 10 },
+    (_value, index) =>
+      `Paragraph number ${index} explains a distinct part of the release process in detail.`
+  );
+  const store = {};
+  let indexWrites = 0;
+  const storageLocal = {
+    async get(keys) {
+      if (keys === undefined || keys === null) {
+        return { ...store };
+      }
+      const result = {};
+      for (const key of Array.isArray(keys) ? keys : [keys]) {
+        if (key in store) {
+          result[key] = store[key];
+        }
+      }
+      return result;
+    },
+    async set(items) {
+      if ("aiPageTranslatorCacheIndex" in items) {
+        indexWrites += 1;
+      }
+      Object.assign(store, items);
+    },
+    async remove(keys) {
+      for (const key of Array.isArray(keys) ? keys : [keys]) {
+        delete store[key];
+      }
+    }
+  };
+  const harness = createHarness({
+    html: `<main>${paragraphs
+      .map((text, index) => `<p id="p-${index}">${text}</p>`)
+      .join("")}</main>`,
+    storageLocal
+  });
+  t.after(harness.close);
+
+  harness.start();
+  const state = await waitForTerminalState(harness, 3000);
+  assert.equal(state.status, "done", state.error);
+
+  const cachedEntries = await waitFor(
+    () => {
+      const keys = Object.keys(store).filter((key) =>
+        key.startsWith("aiPageTranslatorCache:")
+      );
+      return keys.length === paragraphs.length ? keys : null;
+    },
+    "every paragraph to reach the persistent cache",
+    3000
+  );
+
+  assert.equal(cachedEntries.length, paragraphs.length);
+  assert.ok(
+    indexWrites <= cachedEntries.length / 2,
+    `expected the index to be written far fewer than ${cachedEntries.length} ` +
+      `times, got ${indexWrites}`
+  );
+});
+
+test("one batch failing with a malformed model response does not abort the rest of the page", async (t) => {
+  const paragraphA =
+    "Alpha squad ships reliable production software every single day. ".repeat(
+      10
+    );
+  const paragraphB =
+    "Beta squad reviews every incident with careful attention to detail. ".repeat(
+      10
+    );
+  const harness = createHarness({
+    html: `
+      <main>
+        <section><p id="ok">${paragraphA}</p></section>
+        <section><p id="broken">${paragraphB}</p></section>
+      </main>
+    `,
+    translate: (message) => {
+      const isBrokenBatch = message.segments.some((segment) =>
+        segment.text.includes("Beta squad")
+      );
+      if (isBrokenBatch) {
+        return {
+          ok: false,
+          error: "模型返回缺少 translations 数组",
+          code: "MODEL_OUTPUT"
+        };
+      }
+      return successfulTranslation(message);
+    }
+  });
+  t.after(harness.close);
+
+  harness.start();
+  const state = await waitForTerminalState(harness, 3000);
+
+  assert.equal(state.status, "error");
+  assert.match(state.error, /1 处内容翻译失败/);
+  assert.match(
+    harness.document.querySelector("#ok").textContent,
+    /【译文:/,
+    "the successful batch should still be applied even though another batch failed"
+  );
+  assert.doesNotMatch(
+    harness.document.querySelector("#broken").textContent,
+    /【译文:/
   );
 });

@@ -44,6 +44,7 @@
   };
   let taskGeneration = 0;
   let persistentCacheWriteChain = Promise.resolve();
+  const persistentCachePendingWrites = new Map();
   let activeSession = null;
   let pendingStartJobId = "";
 

@@ -2,6 +2,7 @@ import { DEFAULT_SETTINGS } from "../shared.js";
 
 const TRANSLATE_COMMAND = "translate-current-page";
 const SHORTCUTS_URL = "chrome://extensions/shortcuts";
+const PROGRESS_POLL_INTERVAL_MS = 600;
 
 const elements = {
   backend: document.querySelector("#backend"),
@@ -30,6 +31,7 @@ const elements = {
 
 let settings = { ...DEFAULT_SETTINGS };
 let activeTab = null;
+let progressTimer = null;
 
 initialize().catch((error) => setMessage(error.message, "error"));
 
@@ -364,12 +366,42 @@ function updateModeButtons() {
   }
 }
 
+// 内容脚本收到 TRANSLATE_PAGE 后会立即应答，此时进度还是 0/0，
+// 之后的进展只存在于页面内。这里在翻译期间轮询页面状态，
+// 让弹窗里的进度跟着走，而不是一直停在“正在翻译 0 / 0”。
+function startProgressPolling() {
+  if (progressTimer !== null) {
+    return;
+  }
+  progressTimer = window.setInterval(async () => {
+    const response = await sendToPage({ type: "GET_PAGE_STATE" });
+    if (!response?.ok) {
+      stopProgressPolling();
+      return;
+    }
+    applyPageState(response.state);
+  }, PROGRESS_POLL_INTERVAL_MS);
+}
+
+function stopProgressPolling() {
+  if (progressTimer === null) {
+    return;
+  }
+  window.clearInterval(progressTimer);
+  progressTimer = null;
+}
+
 function applyPageState(pageState) {
   if (!pageState) {
     return;
   }
   settings.viewMode = pageState.viewMode || settings.viewMode;
   updateModeButtons();
+  if (pageState.status === "translating") {
+    startProgressPolling();
+  } else {
+    stopProgressPolling();
+  }
   if (pageState.status === "done") {
     setMessage(`已翻译 ${pageState.translated} 处内容`, "success");
     setDot("done");

@@ -30,6 +30,12 @@
           elements.add(element);
         }
       }
+      // 聚焦社交提取只想要推文本体，不能把时间线里的 UI 块卷进来。
+      if (!useFocusedSocialExtraction) {
+        for (const element of collectInlineTextBlocks(root)) {
+          elements.add(element);
+        }
+      }
     }
     // 这两个列表在下面的逐元素循环里被反复扫描，先物化成数组，
     // 避免每次迭代都重新展开 Set（大页面上会退化成平方级开销）。
@@ -53,6 +59,7 @@
       )
     );
     const flowElementList = [...flowElements];
+    const flowCoverage = buildFlowCoverage(flowCandidates);
     let candidates = [...flowCandidates];
 
     for (const element of elements) {
@@ -61,6 +68,7 @@
       }
       if (
         flowElements.has(element) ||
+        isFullyCoveredByFlow(element, flowCoverage) ||
         flowElementList.some((flowElement) =>
           flowElement.contains(element)
         ) ||
@@ -168,6 +176,20 @@
     return document.body ? [document.body] : [];
   }
 
+  // 临时诊断用：正文根是什么、里面有多少 p / div，用来判断段落是否
+  // 落在 primarySelector 覆盖范围内。定位完可删除。
+  function describeContentRoots() {
+    return collectContentRoots()
+      .map((root) => {
+        const name = root.tagName.toLowerCase();
+        const id = root.id ? `#${root.id}` : "";
+        return `${name}${id}(p:${root.querySelectorAll("p").length},` +
+          `div:${root.querySelectorAll("div").length},` +
+          `li:${root.querySelectorAll("li").length})`;
+      })
+      .join(" | ");
+  }
+
   function dedupeCandidatePlacements(candidates) {
     const seenTargets = new Set();
     const seenFlowStarts = new Set();
@@ -213,6 +235,113 @@
     return [...new Set([...exactMatches, ...fallbackMatches])];
   }
 
+  // flow 候选的 target 是容器本身（blockquote、只含内联子节点的 div 等），
+  // 这些容器同时也可能进入元素候选，同一段正文就会被翻译两遍。只有当
+  // flow 已经吃掉容器里全部有效子节点时才跳过元素候选——如果 flow 只覆盖
+  // 了其中一段（例如靠 <br><br> 分段的容器），剩下的仍要交给元素候选。
+  function buildFlowCoverage(flowCandidates) {
+    const coverage = new Map();
+    for (const candidate of flowCandidates) {
+      let nodes = coverage.get(candidate.target);
+      if (!nodes) {
+        nodes = new Set();
+        coverage.set(candidate.target, nodes);
+      }
+      for (const node of candidate.nodes) {
+        nodes.add(node);
+      }
+    }
+    return coverage;
+  }
+
+  function isFullyCoveredByFlow(element, coverage) {
+    const covered = coverage.get(element);
+    if (!covered) {
+      return false;
+    }
+    for (const node of element.childNodes) {
+      if (
+        node.nodeType !== Node.TEXT_NODE &&
+        node.nodeType !== Node.ELEMENT_NODE
+      ) {
+        continue;
+      }
+      if (!normalizeText(node.textContent)) {
+        continue;
+      }
+      if (!covered.has(node)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // X 的文章编辑器把每个段落渲染成 div > span > span[data-text]：页面里
+  // 一个 <p> 都没有，文本节点也不是块容器的直接子节点，primarySelector 和
+  // collectDirectTextNodes 都够不着。这里把“子节点全是内联元素/文本的块级
+  // 容器”本身当作一段正文，补上这类富文本编辑器渲染的页面。
+  function collectInlineTextBlocks(root) {
+    const blocks = [];
+    for (const element of root.querySelectorAll("div, section, li")) {
+      if (!isInlineTextBlock(element)) {
+        continue;
+      }
+      // 裸 div 的数量远大于 <p>，没有下限就会把计数、按钮文案这类 UI
+      // 碎片也当成正文。这里沿用 flow 候选和结构化回退的同一个阈值。
+      // 只做长度粗筛，用 textContent 而非 innerText，避免强制回流。
+      const text = normalizeText(element.textContent);
+      if (text.length >= INLINE_TEXT_BLOCK_MIN_LENGTH) {
+        blocks.push(element);
+      }
+    }
+    return blocks;
+  }
+
+  function isInlineTextBlock(element) {
+    // 先用标签名快速排除含块级子元素的包装层，避免对整页每个 div 都
+    // 调用 getComputedStyle（大页面上这一步会成为瓶颈）。
+    for (const child of element.children) {
+      // 含 <br> 的容器可能是靠换行分段的（一个容器多段正文），
+      // 那是 collectFlowCandidates 的活，这里不越权合并成一段。
+      if (child.tagName === "BR" || BLOCK_LEVEL_TAGS.has(child.tagName)) {
+        return false;
+      }
+    }
+    const display = window.getComputedStyle(element).display;
+    if (
+      display !== "block" &&
+      display !== "flow-root" &&
+      display !== "list-item"
+    ) {
+      return false;
+    }
+
+    let hasText = false;
+    for (const node of element.childNodes) {
+      if (node.nodeType === Node.TEXT_NODE) {
+        if (normalizeText(node.textContent)) {
+          hasText = true;
+        }
+        continue;
+      }
+      if (node.nodeType !== Node.ELEMENT_NODE) {
+        continue;
+      }
+      const childDisplay = window.getComputedStyle(node).display;
+      if (
+        childDisplay !== "inline" &&
+        childDisplay !== "inline-block" &&
+        childDisplay !== "contents"
+      ) {
+        return false;
+      }
+      if (normalizeText(node.textContent)) {
+        hasText = true;
+      }
+    }
+    return hasText;
+  }
+
   function collectFlowCandidates(root) {
     const candidates = [];
     const containers = [
@@ -223,6 +352,7 @@
     for (const container of containers) {
       if (
         container.closest(`[${MARKER}]`) ||
+        container.closest(`[${OWNED_MARKER}]`) ||
         container.closest(
           "script, style, noscript, code, pre, svg, canvas, iframe, textarea, input, select, [contenteditable='true'], [aria-hidden='true'], nav, header, footer, aside"
         )
@@ -336,9 +466,16 @@
   }
 
   function isEligible(element, root, primarySelector) {
+    // 标题的译文块是插在标题“后面”的兄弟节点，不在 [MARKER] 子树内，
+    // 只查 MARKER 会让它在下一轮扫描里被当成新正文再翻一遍。
+    // 同理，flow 译文块是插在容器“里面”的，closest 只往上找，会让容器
+    // （比如带行内链接的 <li>）在下一轮扫描里被整段再翻一遍。
     if (
       element.hasAttribute(MARKER) ||
+      element.hasAttribute(OWNED_MARKER) ||
       element.closest(`[${MARKER}]`) ||
+      element.closest(`[${OWNED_MARKER}]`) ||
+      element.querySelector(`[${MARKER}], [${OWNED_MARKER}]`) ||
       element.closest(
         "script, style, noscript, code, pre, svg, canvas, iframe, textarea, input, select, [contenteditable='true'], [aria-hidden='true']"
       )
@@ -398,6 +535,7 @@
     for (const element of elements) {
       if (
         element.closest(`[${MARKER}]`) ||
+        element.closest(`[${OWNED_MARKER}]`) ||
         element.closest(
           "script, style, noscript, code, pre, svg, canvas, iframe, textarea, input, select, [contenteditable='true'], [aria-hidden='true'], nav, header, footer, aside"
         )

@@ -39,28 +39,48 @@ export function chatCompletionsUrl(baseUrl) {
 }
 
 export function extractJsonObject(content) {
-  const raw = String(content || "").trim();
-  const withoutFence = raw
+  return sliceJson(stripCodeFence(content), "{", "}");
+}
+
+function stripCodeFence(content) {
+  return String(content || "")
+    .trim()
     .replace(/^```(?:json)?\s*/i, "")
     .replace(/\s*```$/, "")
     .trim();
-  const start = withoutFence.indexOf("{");
-  const end = withoutFence.lastIndexOf("}");
+}
+
+function sliceJson(text, open, close) {
+  const start = text.indexOf(open);
+  const end = text.lastIndexOf(close);
   if (start === -1 || end <= start) {
     throw new Error("模型没有返回可识别的 JSON");
   }
-  return JSON.parse(withoutFence.slice(start, end + 1));
+  return JSON.parse(text.slice(start, end + 1));
+}
+
+// 模型可能回 {"translations":[…]}，也可能只回裸的 […]——单片段批次的
+// 输入本身就是数组，模型常照着输入形状回、把外层壳丢掉。取最先出现的
+// 那个括号，两种形状都收。
+function extractTranslationPayload(content) {
+  const text = stripCodeFence(content);
+  const objectStart = text.indexOf("{");
+  const arrayStart = text.indexOf("[");
+  return arrayStart !== -1 && (objectStart === -1 || arrayStart < objectStart)
+    ? sliceJson(text, "[", "]")
+    : sliceJson(text, "{", "}");
 }
 
 export function parseTranslations(content, expectedSegments) {
-  const parsed = extractJsonObject(content);
-  if (!Array.isArray(parsed.translations)) {
+  const parsed = extractTranslationPayload(content);
+  const items = Array.isArray(parsed) ? parsed : parsed?.translations;
+  if (!Array.isArray(items)) {
     throw new Error("模型返回缺少 translations 数组");
   }
 
   const expectedIds = new Set(expectedSegments.map((item) => item.id));
   const result = {};
-  for (const item of parsed.translations) {
+  for (const item of items) {
     if (
       item &&
       expectedIds.has(String(item.id)) &&

@@ -25,6 +25,7 @@
       mutationTimer: null,
       statusHideTimer: null,
       scanRunning: false,
+      scanStats: null,
       rescanRequested: false,
       initializing: true,
       jobClosed: false

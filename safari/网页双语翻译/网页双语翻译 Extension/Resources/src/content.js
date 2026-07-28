@@ -25,6 +25,13 @@
     "ai-page-translator-bilingual",
     "ai-page-translator-translated"
   ];
+  const BLOCK_LEVEL_TAGS = new Set([
+    "ADDRESS", "ARTICLE", "ASIDE", "BLOCKQUOTE", "DETAILS", "DIALOG",
+    "DIV", "DL", "FIELDSET", "FIGCAPTION", "FIGURE", "FOOTER", "FORM",
+    "H1", "H2", "H3", "H4", "H5", "H6", "HEADER", "HR", "LI", "MAIN",
+    "NAV", "OL", "P", "PRE", "SECTION", "TABLE", "UL"
+  ]);
+  const INLINE_TEXT_BLOCK_MIN_LENGTH = 20;
   const DYNAMIC_RESCAN_DELAYS = [0, 400, 900];
   const DEFAULT_TEXT_MAX_LENGTH = 1200;
   const LOCAL_TRANSLATION_BATCH_CONCURRENCY = 2;
@@ -166,6 +173,7 @@
       mutationTimer: null,
       statusHideTimer: null,
       scanRunning: false,
+      scanStats: null,
       rescanRequested: false,
       initializing: true,
       jobClosed: false
@@ -405,15 +413,21 @@
     }
 
     session.scanRunning = true;
+    const stats = createScanStats(session);
+    session.scanStats = stats;
     try {
       const settings = session.settings;
-      const collected = collectCandidates(
+      const rawCollected = collectCandidates(
         session.maxPlacements +
           session.pendingRetranslationTargets.size
-      ).filter(
+      );
+      const collected = rawCollected.filter(
         (placement) =>
           !isAlreadyTargetLanguage(placement.text, settings.targetLanguage)
       );
+      stats.collected = rawCollected.length;
+      stats.skippedTargetLanguage =
+        rawCollected.length - collected.length;
       let availableNewPlacements = remaining;
       const placements = collected.filter((placement) => {
         if (session.countedTargets.has(placementIdentity(placement))) {
@@ -425,6 +439,7 @@
         availableNewPlacements -= 1;
         return true;
       });
+      recordPlacementTypes(stats, placements);
       if (placements.length === 0) {
         return { discovered: 0, failures: [] };
       }
@@ -444,10 +459,12 @@
       showTranslationProgress(session);
 
       const groups = await groupCandidatePlacements(placements, session);
+      stats.groups = groups.length;
       assertCurrentTask(session.taskId);
       for (const group of groups) {
         const cached = session.translationCache.get(group.key);
         if (cached) {
+          stats.cacheHits += 1;
           applyTranslatedGroup(session, group, cached);
         }
       }
@@ -455,10 +472,13 @@
       const candidates = groups
         .filter((group) => !group.applied)
         .flatMap((group) => group.fragments);
+      stats.segments = candidates.length;
       let batchFailures = [];
       if (candidates.length > 0) {
+        const batches = makeBatches(candidates, settings);
+        stats.batches = batches.length;
         batchFailures = await translateCandidateBatches(
-          makeBatches(candidates, settings),
+          batches,
           getTranslationBatchConcurrency(settings),
           shouldWarmupFirstBatch(settings),
           session.taskId,
@@ -467,6 +487,7 @@
             for (const candidate of batch) {
               const translatedText = response.translations[candidate.id];
               if (!translatedText) {
+                stats.missingTranslations += 1;
                 continue;
               }
               candidate.group.translations.set(
@@ -501,7 +522,10 @@
       }
 
       assertCurrentTask(session.taskId);
+      recordUnappliedGroups(stats, groups);
+      recordBatchErrors(stats, batchFailures);
       const failedPlacements = countFailedPlacements(batchFailures);
+      stats.failedPlacements = failedPlacements;
       const hasFailures = failedPlacements > 0;
       state = {
         ...state,
@@ -524,8 +548,165 @@
       return { discovered: placements.length, failures: batchFailures };
     } finally {
       session.scanRunning = false;
+      session.scanStats = null;
+      logScanDiagnostics(session, stats);
     }
   }
+
+  // ==== 临时诊断（定位“只翻译了一小部分”）====================
+  // 每轮扫描输出一行 [双语翻译诊断]，把“采集到多少 / 过滤掉多少 /
+  // 发了几批 / 落地成功多少 / 各类丢失多少”摊开。定位完可整块删除，
+  // 并移除 pipeline.js 中对 stats 的赋值。
+  function createScanStats(session) {
+    return {
+      startedAt: Date.now(),
+      usedAtStart: session.usedPlacements,
+      collected: 0,
+      skippedTargetLanguage: 0,
+      placements: 0,
+      byType: {},
+      groups: 0,
+      cacheHits: 0,
+      segments: 0,
+      batches: 0,
+      missingTranslations: 0,
+      appliedPlacements: 0,
+      applyFailedDetached: 0,
+      applyFailedMarked: 0,
+      limitSkipped: 0,
+      unappliedGroups: 0,
+      unappliedSamples: [],
+      duplicatedTails: [],
+      batchErrors: [],
+      failedPlacements: 0
+    };
+  }
+
+  function recordPlacementTypes(stats, placements) {
+    stats.placements = placements.length;
+    for (const placement of placements) {
+      const kind = placement.structured
+        ? "structured"
+        : placement.targetType;
+      stats.byType[kind] = (stats.byType[kind] || 0) + 1;
+      recordDuplicatedTail(stats, placement);
+    }
+  }
+
+  // 定位“链接文字在段末被重复一遍”：找出正文里结尾片段在前文已出现过
+  // 的 placement，连同它的类型、目标标签和直接子节点一起打出来。
+  function recordDuplicatedTail(stats, placement) {
+    const tail = findDuplicatedTail(placement.text);
+    if (!tail || stats.duplicatedTails.length >= 4) {
+      return;
+    }
+    const target = placement.target;
+    const element = target?.nodeType === Node.ELEMENT_NODE
+      ? target
+      : target?.parentElement;
+    stats.duplicatedTails.push({
+      类型: placement.targetType,
+      目标: element
+        ? `${element.tagName.toLowerCase()}[${
+          window.getComputedStyle(element).display
+        }]`
+        : String(target?.nodeName || ""),
+      重复片段: tail,
+      正文长度: placement.text.length,
+      flow节点: (placement.nodes || []).map((node) =>
+        node.nodeType === Node.ELEMENT_NODE
+          ? node.tagName.toLowerCase()
+          : "#text"
+      ),
+      目标子节点: element
+        ? [...element.childNodes].map((node) =>
+          node.nodeType === Node.ELEMENT_NODE
+            ? node.tagName.toLowerCase()
+            : "#text"
+        )
+        : []
+    });
+  }
+
+  function findDuplicatedTail(text) {
+    const normalized = String(text || "").trim();
+    for (let length = 40; length >= 12; length -= 4) {
+      if (normalized.length < length * 2) {
+        continue;
+      }
+      const tail = normalized.slice(-length);
+      if (normalized.slice(0, -length).includes(tail)) {
+        return tail;
+      }
+    }
+    return "";
+  }
+
+  function recordUnappliedGroups(stats, groups) {
+    for (const group of groups) {
+      if (group.applied) {
+        continue;
+      }
+      stats.unappliedGroups += 1;
+      if (stats.unappliedSamples.length < 3) {
+        stats.unappliedSamples.push(group.text.slice(0, 60));
+      }
+    }
+  }
+
+  function recordBatchErrors(stats, failures) {
+    for (const failure of failures) {
+      stats.batchErrors.push({
+        segments: failure.batch.length,
+        code: failure.error?.code || "",
+        message:
+          failure.error instanceof Error
+            ? failure.error.message
+            : String(failure.error)
+      });
+    }
+  }
+
+  function logScanDiagnostics(session, stats) {
+    if (!stats) {
+      return;
+    }
+    // 这个函数是在 finally 里调用的：诊断自身抛异常会顶掉真正的错误。
+    try {
+      writeScanDiagnostics(session, stats);
+    } catch (_error) {
+      // 诊断失败不影响翻译本身。
+    }
+  }
+
+  function writeScanDiagnostics(session, stats) {
+    console.info("[双语翻译诊断]", {
+      页面: location.href,
+      正文根: describeContentRoots(),
+      耗时毫秒: Date.now() - stats.startedAt,
+      后端: session.settings.backend,
+      上限maxSegments: session.maxPlacements,
+      "1_采集到": stats.collected,
+      "2_已是目标语言跳过": stats.skippedTargetLanguage,
+      "3_本轮候选": stats.placements,
+      "3b_候选类型": stats.byType,
+      "3c_正文含重复片段": stats.duplicatedTails,
+      "4_去重后分组": stats.groups,
+      "4b_命中缓存": stats.cacheHits,
+      "5_待翻译片段": stats.segments,
+      "5b_请求批次": stats.batches,
+      "6_模型漏译片段": stats.missingTranslations,
+      "7_落地成功": stats.appliedPlacements,
+      "7a_落地失败_节点已断开": stats.applyFailedDetached,
+      "7b_落地失败_已被标记": stats.applyFailedMarked,
+      "7c_超出上限跳过": stats.limitSkipped,
+      "8_始终没拿到译文的分组": stats.unappliedGroups,
+      "8b_样例": stats.unappliedSamples,
+      "9_失败批次": stats.batchErrors,
+      "9b_计入失败的位置数": stats.failedPlacements
+    });
+  }
+  // ==== 临时诊断结束 =========================================
 
   async function groupCandidatePlacements(placements, session) {
     const groupsByKey = new Map();
@@ -575,8 +756,9 @@
       return;
     }
     let newPlacements = 0;
+    const stats = session.scanStats;
     withObserverPaused(session, () => {
-      for (const placement of group.placements) {
+      for (const [index, placement] of group.placements.entries()) {
         const identity = placementIdentity(placement);
         const alreadyCounted = session.countedTargets.has(
           identity
@@ -586,6 +768,9 @@
           session.usedPlacements + newPlacements >=
             session.maxPlacements
         ) {
+          if (stats) {
+            stats.limitSkipped += group.placements.length - index;
+          }
           break;
         }
         if (
@@ -597,13 +782,21 @@
             placement.nodes
           )
         ) {
+          if (stats) {
+            stats.appliedPlacements += 1;
+          }
           session.pendingRetranslationTargets.delete(placement.target);
           if (!alreadyCounted) {
             session.countedTargets.add(identity);
             newPlacements += 1;
           }
         } else if (!placement.target.isConnected) {
+          if (stats) {
+            stats.applyFailedDetached += 1;
+          }
           session.pendingRetranslationTargets.delete(placement.target);
+        } else if (stats) {
+          stats.applyFailedMarked += 1;
         }
       }
     });
@@ -750,6 +943,14 @@
           throw error;
         }
         lastError = error instanceof Error ? error.message : String(error);
+        // 临时诊断：把每次批次请求失败的原因打出来（超时 / 模型格式 /
+        // 连接失败），定位完可删除。
+        console.warn(
+          `[双语翻译诊断] 批次请求失败 attempt=${attempt} ` +
+          `segments=${batch.length} chars=${
+            batch.reduce((total, item) => total + item.text.length, 0)
+          } code=${error?.code || ""} ${lastError}`
+        );
       }
 
       if (attempt === 0) {
@@ -1001,6 +1202,12 @@
           elements.add(element);
         }
       }
+      // 聚焦社交提取只想要推文本体，不能把时间线里的 UI 块卷进来。
+      if (!useFocusedSocialExtraction) {
+        for (const element of collectInlineTextBlocks(root)) {
+          elements.add(element);
+        }
+      }
     }
     // 这两个列表在下面的逐元素循环里被反复扫描，先物化成数组，
     // 避免每次迭代都重新展开 Set（大页面上会退化成平方级开销）。
@@ -1024,6 +1231,7 @@
       )
     );
     const flowElementList = [...flowElements];
+    const flowCoverage = buildFlowCoverage(flowCandidates);
     let candidates = [...flowCandidates];
 
     for (const element of elements) {
@@ -1032,6 +1240,7 @@
       }
       if (
         flowElements.has(element) ||
+        isFullyCoveredByFlow(element, flowCoverage) ||
         flowElementList.some((flowElement) =>
           flowElement.contains(element)
         ) ||
@@ -1139,6 +1348,20 @@
     return document.body ? [document.body] : [];
   }
 
+  // 临时诊断用：正文根是什么、里面有多少 p / div，用来判断段落是否
+  // 落在 primarySelector 覆盖范围内。定位完可删除。
+  function describeContentRoots() {
+    return collectContentRoots()
+      .map((root) => {
+        const name = root.tagName.toLowerCase();
+        const id = root.id ? `#${root.id}` : "";
+        return `${name}${id}(p:${root.querySelectorAll("p").length},` +
+          `div:${root.querySelectorAll("div").length},` +
+          `li:${root.querySelectorAll("li").length})`;
+      })
+      .join(" | ");
+  }
+
   function dedupeCandidatePlacements(candidates) {
     const seenTargets = new Set();
     const seenFlowStarts = new Set();
@@ -1184,6 +1407,113 @@
     return [...new Set([...exactMatches, ...fallbackMatches])];
   }
 
+  // flow 候选的 target 是容器本身（blockquote、只含内联子节点的 div 等），
+  // 这些容器同时也可能进入元素候选，同一段正文就会被翻译两遍。只有当
+  // flow 已经吃掉容器里全部有效子节点时才跳过元素候选——如果 flow 只覆盖
+  // 了其中一段（例如靠 <br><br> 分段的容器），剩下的仍要交给元素候选。
+  function buildFlowCoverage(flowCandidates) {
+    const coverage = new Map();
+    for (const candidate of flowCandidates) {
+      let nodes = coverage.get(candidate.target);
+      if (!nodes) {
+        nodes = new Set();
+        coverage.set(candidate.target, nodes);
+      }
+      for (const node of candidate.nodes) {
+        nodes.add(node);
+      }
+    }
+    return coverage;
+  }
+
+  function isFullyCoveredByFlow(element, coverage) {
+    const covered = coverage.get(element);
+    if (!covered) {
+      return false;
+    }
+    for (const node of element.childNodes) {
+      if (
+        node.nodeType !== Node.TEXT_NODE &&
+        node.nodeType !== Node.ELEMENT_NODE
+      ) {
+        continue;
+      }
+      if (!normalizeText(node.textContent)) {
+        continue;
+      }
+      if (!covered.has(node)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // X 的文章编辑器把每个段落渲染成 div > span > span[data-text]：页面里
+  // 一个 <p> 都没有，文本节点也不是块容器的直接子节点，primarySelector 和
+  // collectDirectTextNodes 都够不着。这里把“子节点全是内联元素/文本的块级
+  // 容器”本身当作一段正文，补上这类富文本编辑器渲染的页面。
+  function collectInlineTextBlocks(root) {
+    const blocks = [];
+    for (const element of root.querySelectorAll("div, section, li")) {
+      if (!isInlineTextBlock(element)) {
+        continue;
+      }
+      // 裸 div 的数量远大于 <p>，没有下限就会把计数、按钮文案这类 UI
+      // 碎片也当成正文。这里沿用 flow 候选和结构化回退的同一个阈值。
+      // 只做长度粗筛，用 textContent 而非 innerText，避免强制回流。
+      const text = normalizeText(element.textContent);
+      if (text.length >= INLINE_TEXT_BLOCK_MIN_LENGTH) {
+        blocks.push(element);
+      }
+    }
+    return blocks;
+  }
+
+  function isInlineTextBlock(element) {
+    // 先用标签名快速排除含块级子元素的包装层，避免对整页每个 div 都
+    // 调用 getComputedStyle（大页面上这一步会成为瓶颈）。
+    for (const child of element.children) {
+      // 含 <br> 的容器可能是靠换行分段的（一个容器多段正文），
+      // 那是 collectFlowCandidates 的活，这里不越权合并成一段。
+      if (child.tagName === "BR" || BLOCK_LEVEL_TAGS.has(child.tagName)) {
+        return false;
+      }
+    }
+    const display = window.getComputedStyle(element).display;
+    if (
+      display !== "block" &&
+      display !== "flow-root" &&
+      display !== "list-item"
+    ) {
+      return false;
+    }
+
+    let hasText = false;
+    for (const node of element.childNodes) {
+      if (node.nodeType === Node.TEXT_NODE) {
+        if (normalizeText(node.textContent)) {
+          hasText = true;
+        }
+        continue;
+      }
+      if (node.nodeType !== Node.ELEMENT_NODE) {
+        continue;
+      }
+      const childDisplay = window.getComputedStyle(node).display;
+      if (
+        childDisplay !== "inline" &&
+        childDisplay !== "inline-block" &&
+        childDisplay !== "contents"
+      ) {
+        return false;
+      }
+      if (normalizeText(node.textContent)) {
+        hasText = true;
+      }
+    }
+    return hasText;
+  }
+
   function collectFlowCandidates(root) {
     const candidates = [];
     const containers = [
@@ -1194,6 +1524,7 @@
     for (const container of containers) {
       if (
         container.closest(`[${MARKER}]`) ||
+        container.closest(`[${OWNED_MARKER}]`) ||
         container.closest(
           "script, style, noscript, code, pre, svg, canvas, iframe, textarea, input, select, [contenteditable='true'], [aria-hidden='true'], nav, header, footer, aside"
         )
@@ -1307,9 +1638,16 @@
   }
 
   function isEligible(element, root, primarySelector) {
+    // 标题的译文块是插在标题“后面”的兄弟节点，不在 [MARKER] 子树内，
+    // 只查 MARKER 会让它在下一轮扫描里被当成新正文再翻一遍。
+    // 同理，flow 译文块是插在容器“里面”的，closest 只往上找，会让容器
+    // （比如带行内链接的 <li>）在下一轮扫描里被整段再翻一遍。
     if (
       element.hasAttribute(MARKER) ||
+      element.hasAttribute(OWNED_MARKER) ||
       element.closest(`[${MARKER}]`) ||
+      element.closest(`[${OWNED_MARKER}]`) ||
+      element.querySelector(`[${MARKER}], [${OWNED_MARKER}]`) ||
       element.closest(
         "script, style, noscript, code, pre, svg, canvas, iframe, textarea, input, select, [contenteditable='true'], [aria-hidden='true']"
       )
@@ -1369,6 +1707,7 @@
     for (const element of elements) {
       if (
         element.closest(`[${MARKER}]`) ||
+        element.closest(`[${OWNED_MARKER}]`) ||
         element.closest(
           "script, style, noscript, code, pre, svg, canvas, iframe, textarea, input, select, [contenteditable='true'], [aria-hidden='true'], nav, header, footer, aside"
         )
@@ -1499,7 +1838,12 @@
     }
 
     const element = target;
-    if (!element.isConnected || element.hasAttribute(MARKER)) {
+    if (
+      !element.isConnected ||
+      element.hasAttribute(MARKER) ||
+      // 里面已经有 flow/文本节点的译文块了，再往元素上追加就成了两块译文
+      element.querySelector(`[${MARKER}], .${TRANSLATION_CLASS}`)
+    ) {
       return false;
     }
     if (element.matches("h1, h2, h3, h4, h5, h6, [role='heading']")) {

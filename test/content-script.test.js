@@ -114,9 +114,10 @@ test("dynamic social pages apply batches as concurrent workers and rescan", asyn
   assert.match(content, /const LOCAL_BATCH_SEGMENT_LIMIT = 18/);
   assert.match(content, /const LOCAL_BATCH_CHARACTER_LIMIT = 4200/);
   assert.match(content, /shouldRescanDynamicContent\(\)/);
+  assert.match(content, /const batches = makeBatches\(candidates, settings\)/);
   assert.match(
     content,
-    /translateCandidateBatches\(\s*makeBatches\(candidates, settings\),\s*getTranslationBatchConcurrency\(settings\),\s*shouldWarmupFirstBatch\(settings\)/
+    /translateCandidateBatches\(\s*batches,\s*getTranslationBatchConcurrency\(settings\),\s*shouldWarmupFirstBatch\(settings\)/
   );
   assert.match(content, /settings\?\.backend === "deepseek"/);
   assert.match(content, /function shouldWarmupFirstBatch\(settings\)/);

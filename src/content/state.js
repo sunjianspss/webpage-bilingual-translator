@@ -17,6 +17,13 @@
     "ai-page-translator-bilingual",
     "ai-page-translator-translated"
   ];
+  const BLOCK_LEVEL_TAGS = new Set([
+    "ADDRESS", "ARTICLE", "ASIDE", "BLOCKQUOTE", "DETAILS", "DIALOG",
+    "DIV", "DL", "FIELDSET", "FIGCAPTION", "FIGURE", "FOOTER", "FORM",
+    "H1", "H2", "H3", "H4", "H5", "H6", "HEADER", "HR", "LI", "MAIN",
+    "NAV", "OL", "P", "PRE", "SECTION", "TABLE", "UL"
+  ]);
+  const INLINE_TEXT_BLOCK_MIN_LENGTH = 20;
   const DYNAMIC_RESCAN_DELAYS = [0, 400, 900];
   const DEFAULT_TEXT_MAX_LENGTH = 1200;
   const LOCAL_TRANSLATION_BATCH_CONCURRENCY = 2;

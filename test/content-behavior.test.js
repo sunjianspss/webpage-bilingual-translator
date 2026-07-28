@@ -906,3 +906,219 @@ test("one batch failing with a malformed model response does not abort the rest 
     /【译文:/
   );
 });
+
+test("translates rich-text paragraphs rendered as div > span without any <p>", async (t) => {
+  const first =
+    "Unlike a prompt, context is used generally across many requests.";
+  const second =
+    "This can be surprisingly difficult as the model capabilities evolve.";
+  const harness = createHarness({
+    html: `
+      <main>
+        <div data-testid="article-body">
+          <div><span><span data-text="true">${first}</span></span></div>
+          <div><span><span data-text="true">${second}</span></span></div>
+        </div>
+      </main>
+    `
+  });
+  t.after(harness.close);
+
+  harness.start();
+  const state = await waitForTerminalState(harness);
+
+  assert.equal(state.status, "done", state.error);
+  assert.deepEqual(
+    new Set(harness.requestedSegments().map(({ text }) => text)),
+    new Set([first, second])
+  );
+  assert.equal(
+    harness.document.querySelectorAll(TRANSLATION_SELECTOR).length,
+    2
+  );
+});
+
+test("never re-collects a heading translation on a later rescan", async (t) => {
+  const harness = createHarness({
+    html: `
+      <main id="rescan-root">
+        <h2>Unhobbling Claude</h2>
+        <p>Overall, we found that we were over-constraining the agent.</p>
+      </main>
+    `
+  });
+  t.after(harness.close);
+
+  harness.start();
+  const state = await waitForTerminalState(harness);
+  assert.equal(state.status, "done", state.error);
+  const afterFirstPass = harness.requestedSegments().length;
+
+  // 触发一次增量扫描：标题的译文块是标题的兄弟节点，不在 [MARKER] 子树里，
+  // 必须靠 OWNED_MARKER 才能挡住，否则会被当成新正文再翻一遍。
+  const late = harness.document.createElement("p");
+  late.textContent = "A later paragraph triggers one more incremental scan.";
+  harness.document.querySelector("#rescan-root").append(late);
+  await new Promise((resolve) => setTimeout(resolve, 260));
+
+  const translatedTexts = harness
+    .requestedSegments()
+    .map(({ text }) => text);
+  assert.deepEqual(
+    translatedTexts.filter((text) => text.includes("【译文:")),
+    [],
+    "the extension must never send its own translation back for translation"
+  );
+  assert.equal(
+    translatedTexts.filter((text) => text === "Unhobbling Claude").length,
+    1,
+    "the heading must be sent for translation exactly once"
+  );
+  assert.ok(
+    translatedTexts.length > afterFirstPass,
+    "the incremental scan should still pick up genuinely new content"
+  );
+  assert.equal(
+    harness.document.querySelectorAll(
+      ".ai-page-translator-translation-heading"
+    ).length,
+    1
+  );
+});
+
+test("a linked paragraph in a bare div is translated exactly once", async (t) => {
+  const paragraph =
+    "Some article text with a reference inside it and a trailing explanation.";
+  const harness = createHarness({
+    html: `
+      <main>
+        <div>Some article text with <a href="#ref">a reference</a> inside it and a trailing explanation.</div>
+      </main>
+    `
+  });
+  t.after(harness.close);
+
+  harness.start();
+  const state = await waitForTerminalState(harness);
+
+  assert.equal(state.status, "done", state.error);
+  assert.equal(
+    harness.document.querySelectorAll(TRANSLATION_SELECTOR).length,
+    1,
+    "the flow placement and the inline-text-block placement must not both apply"
+  );
+  assert.deepEqual(
+    harness.requestedSegments().map(({ text }) => text),
+    [paragraph]
+  );
+});
+
+test("an X-style paragraph with an inline-div link is translated once, without duplicated link text", async (t) => {
+  const lead = "But when you send a message to Claude, the prompt is only a small part of the context it gets. We call this ";
+  const linkText = "context engineering";
+  const tail = ", and it makes a big impact on the results you generate.";
+  const harness = createHarness({
+    url: "https://x.com/trq212/article/2080710971228918066",
+    html: `
+      <main>
+        <div>
+          <div id="para">
+            <span><span data-text="true">${lead}</span></span>
+            <div style="display:inline"><a href="https://example.com/ctx"><span><span data-text="true">${linkText}</span></span></a></div>
+            <span><span data-text="true">${tail}</span></span>
+          </div>
+        </div>
+      </main>
+    `
+  });
+  t.after(harness.close);
+
+  harness.start();
+  const state = await waitForTerminalState(harness);
+  const requested = harness.requestedSegments().map(({ text }) => text);
+
+  assert.equal(state.status, "done", state.error);
+  assert.equal(
+    requested.length,
+    1,
+    `expected one placement, got ${requested.length}`
+  );
+  assert.equal(
+    (requested[0].match(/context engineering/g) || []).length,
+    1,
+    "the link text must appear exactly once in the source sent for translation"
+  );
+});
+
+// anthropic.com 的正文编号列表：<li> 里既有行内链接又有脚注 <sup>，
+// 它同时被 flow 候选和元素候选选中，两边各插一块译文，页面上就出现了
+// 两个「译文」块。
+test("a list item with an inline link gets exactly one translation block", async (t) => {
+  const harness = createHarness({
+    html: `
+      <main>
+        <article>
+          <ol>
+            <li>My secondary concern is the risk that powerful AI models may be misused to carry out cyberattacks or biological attacks, and may have <a href="#alignment">serious alignment problems</a>. Open-weights models do potentially present a higher risk than closed models, because it is very difficult to apply guardrails to them, and once weights are released they cannot be withdrawn<sup>2</sup>. But banning the use of these models by US businesses does nothing to address this risk.</li>
+          </ol>
+        </article>
+      </main>
+    `
+  });
+  t.after(harness.close);
+
+  harness.start();
+  const state = await waitForTerminalState(harness);
+  const requested = harness.requestedSegments().map(({ text }) => text);
+
+  assert.equal(state.status, "done", state.error);
+  assert.equal(
+    harness.document.querySelectorAll(TRANSLATION_SELECTOR).length,
+    1,
+    "the flow placement and the element placement must not both apply"
+  );
+  assert.equal(
+    requested.length,
+    1,
+    `expected one placement, got ${requested.length}: ${JSON.stringify(requested)}`
+  );
+});
+
+// 重新扫描时，<li> 里已经有 flow 译文块了（MARKER 在后代上，不在 li 上），
+// 元素候选的 closest 只往上找，会把整个 li 当成新正文再翻一遍。
+test("a rescan does not re-translate a list item that already holds a translation", async (t) => {
+  const harness = createHarness({
+    html: `
+      <main>
+        <article id="root">
+          <ol>
+            <li>My secondary concern is the risk that powerful AI models may be misused to carry out cyberattacks, and may have <a href="#alignment">serious alignment problems</a>. Open-weights models do potentially present a higher risk than closed models, because guardrails are hard to apply.</li>
+          </ol>
+        </article>
+      </main>
+    `
+  });
+  t.after(harness.close);
+
+  harness.start();
+  await waitForTerminalState(harness);
+  const afterFirstPass =
+    harness.document.querySelectorAll(TRANSLATION_SELECTOR).length;
+
+  const dynamicParagraph = harness.document.createElement("p");
+  dynamicParagraph.textContent =
+    "To address these concerns, I do support the following three measures.";
+  harness.document.getElementById("root").append(dynamicParagraph);
+  await waitFor(
+    () => dynamicParagraph.textContent.includes("【译文:"),
+    "the MutationObserver translation",
+    1200
+  );
+
+  assert.equal(afterFirstPass, 1);
+  assert.equal(
+    harness.document.querySelectorAll(TRANSLATION_SELECTOR).length,
+    2,
+    "the rescan must add one block for the new paragraph and none for the list item"
+  );
+});

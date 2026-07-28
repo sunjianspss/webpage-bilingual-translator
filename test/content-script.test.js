@@ -109,8 +109,8 @@ test("dynamic social pages apply batches as concurrent workers and rescan", asyn
   const content = await readFile(chromeContentUrl, "utf8");
 
   assert.match(content, /const DYNAMIC_RESCAN_DELAYS = \[0, 400, 900\]/);
-  assert.match(content, /const LOCAL_TRANSLATION_BATCH_CONCURRENCY = 2/);
-  assert.match(content, /const REMOTE_TRANSLATION_BATCH_CONCURRENCY = 3/);
+  assert.match(content, /const LOCAL_TRANSLATION_BATCH_CONCURRENCY = 4/);
+  assert.match(content, /const REMOTE_TRANSLATION_BATCH_CONCURRENCY = 6/);
   assert.match(content, /const LOCAL_BATCH_SEGMENT_LIMIT = 18/);
   assert.match(content, /const LOCAL_BATCH_CHARACTER_LIMIT = 4200/);
   assert.match(content, /shouldRescanDynamicContent\(\)/);

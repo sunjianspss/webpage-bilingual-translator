@@ -13,6 +13,12 @@
     "[data-testid='commentText']",
     "[data-testid='comment-text']"
   ].join(", ");
+  // 采集时“这个容器整体不该碰”的判定：合成一个选择器，让 closest 只
+  // 沿祖先链走一趟，而不是每个容器走三趟。
+  const EXCLUDED_CONTAINER_SELECTOR =
+    `[${MARKER}], [${OWNED_MARKER}], script, style, noscript, code, pre, ` +
+    "svg, canvas, iframe, textarea, input, select, " +
+    "[contenteditable='true'], [aria-hidden='true'], nav, header, footer, aside";
   const VIEW_CLASSES = [
     "ai-page-translator-bilingual",
     "ai-page-translator-translated"
@@ -26,8 +32,11 @@
   const INLINE_TEXT_BLOCK_MIN_LENGTH = 20;
   const DYNAMIC_RESCAN_DELAYS = [0, 400, 900];
   const DEFAULT_TEXT_MAX_LENGTH = 1200;
-  const LOCAL_TRANSLATION_BATCH_CONCURRENCY = 2;
-  const REMOTE_TRANSLATION_BATCH_CONCURRENCY = 3;
+  // 整页耗时 ≈ ceil(批次数 / 并发数) × 单批往返时间，并发是唯一的线性
+  // 杠杆。远端 DeepSeek 的限流远高于此；本地 OpenAI 兼容服务（LM Studio、
+  // vLLM 等）默认都能并行处理数条请求，串行度不足时也只是排队，不会出错。
+  const LOCAL_TRANSLATION_BATCH_CONCURRENCY = 4;
+  const REMOTE_TRANSLATION_BATCH_CONCURRENCY = 6;
   const LOCAL_FIRST_BATCH_SEGMENT_LIMIT = 5;
   const LOCAL_FIRST_BATCH_CHARACTER_LIMIT = 1400;
   const LOCAL_BATCH_SEGMENT_LIMIT = 18;
@@ -50,6 +59,9 @@
     ko: /[\uac00-\ud7af]/
   };
   let taskGeneration = 0;
+  // 预热批只是为了给冷启动的本地模型留出加载时间：一旦本页已经成功拿到
+  // 过一次译文，模型必然是热的，再串行等一整个往返就是纯浪费。
+  let backendWarmedUp = false;
   let persistentCacheWriteChain = Promise.resolve();
   const persistentCachePendingWrites = new Map();
   let activeSession = null;

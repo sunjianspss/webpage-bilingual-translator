@@ -556,7 +556,7 @@
   }
 
   function shouldWarmupFirstBatch(settings) {
-    return settings?.backend !== "deepseek";
+    return settings?.backend !== "deepseek" && !backendWarmedUp;
   }
 
   async function requestTranslationBatch(batch, taskId) {
@@ -575,6 +575,7 @@
         });
         assertCurrentTask(taskId);
         if (response?.ok) {
+          backendWarmedUp = true;
           return response;
         }
         const responseError = new Error(response?.error || lastError);

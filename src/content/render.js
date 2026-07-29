@@ -22,7 +22,12 @@
     }
 
     const element = target;
-    if (!element.isConnected || element.hasAttribute(MARKER)) {
+    if (
+      !element.isConnected ||
+      element.hasAttribute(MARKER) ||
+      // 里面已经有 flow/文本节点的译文块了，再往元素上追加就成了两块译文
+      element.querySelector(`[${MARKER}], .${TRANSLATION_CLASS}`)
+    ) {
       return false;
     }
     if (element.matches("h1, h2, h3, h4, h5, h6, [role='heading']")) {

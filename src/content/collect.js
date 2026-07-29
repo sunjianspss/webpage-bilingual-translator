@@ -1,3 +1,39 @@
+  // 采集里到处是“某个候选是不是被另一个候选套住”的判断。逐对调用
+  // contains 在候选上百的页面上是平方级开销，而每次动态重扫都要重跑一遍。
+  // 这两个工具把它换成“沿 parentElement 上溯一次 + Set 查询”，
+  // 结果完全等价（contains 含自身，靠 includeSelf 对齐）。
+  function hasAncestorIn(node, elements, includeSelf = true) {
+    if (elements.size === 0) {
+      return false;
+    }
+    let current =
+      includeSelf && node?.nodeType === Node.ELEMENT_NODE
+        ? node
+        : node?.parentElement;
+    while (current) {
+      if (elements.has(current)) {
+        return true;
+      }
+      current = current.parentElement;
+    }
+    return false;
+  }
+
+  // 收集每个元素自身及其全部祖先。此后“存在某个 e 使 x.contains(e)”
+  // 就是一次 Set 查询：x 必然在某个 e 的祖先链上。
+  function collectAncestorSet(elements) {
+    const ancestors = new Set();
+    for (const element of elements) {
+      for (let node = element; node; node = node.parentElement) {
+        if (ancestors.has(node)) {
+          break;
+        }
+        ancestors.add(node);
+      }
+    }
+    return ancestors;
+  }
+
   function normalizePlacementLimit(value) {
     const parsed = Number.parseInt(value, 10);
     return Number.isFinite(parsed) && parsed > 0 ? parsed : 220;
@@ -30,21 +66,23 @@
           elements.add(element);
         }
       }
+      // 聚焦社交提取只想要推文本体，不能把时间线里的 UI 块卷进来。
+      if (!useFocusedSocialExtraction) {
+        for (const element of collectInlineTextBlocks(root)) {
+          elements.add(element);
+        }
+      }
     }
-    // 这两个列表在下面的逐元素循环里被反复扫描，先物化成数组，
-    // 避免每次迭代都重新展开 Set（大页面上会退化成平方级开销）。
-    const structuredTextList = [...structuredTextElements];
+    // 结构化元素的祖先集合：candidate.target.contains(结构化元素) 等价于
+    // target 出现在这个集合里，target === 结构化元素也被它覆盖。
+    const structuredAncestors = collectAncestorSet(structuredTextElements);
     const flowCandidates = useFocusedSocialExtraction
       ? []
       : roots.flatMap((root) =>
         collectFlowCandidates(root).filter(
           (candidate) =>
-            !structuredTextList.some(
-              (element) =>
-                element === candidate.target ||
-                element.contains(candidate.target) ||
-                candidate.target.contains(element)
-            )
+            !structuredAncestors.has(candidate.target) &&
+            !hasAncestorIn(candidate.target, structuredTextElements)
         )
       );
     const flowElements = new Set(
@@ -52,23 +90,24 @@
         candidate.nodes.filter((node) => node.nodeType === Node.ELEMENT_NODE)
       )
     );
-    const flowElementList = [...flowElements];
+    const flowCoverage = buildFlowCoverage(flowCandidates);
     let candidates = [...flowCandidates];
 
+    // 这个上限是用来兜住超大页面的采集开销的，只应约束本循环自己的产出。
+    // 原来它比的是 candidates.length，而数组里已经躺着全部 flow 候选：
+    // 带内联链接的列表项一多（真实站点里很常见），元素循环会在第一次
+    // 迭代就 break，页面顶部的标题和正文根本没被采集，后面再怎么排序都
+    // 救不回来。
+    let collectedElements = 0;
+
     for (const element of elements) {
-      if (candidates.length >= limit * 3) {
+      if (collectedElements >= limit * 3) {
         break;
       }
       if (
-        flowElements.has(element) ||
-        flowElementList.some((flowElement) =>
-          flowElement.contains(element)
-        ) ||
-        structuredTextList.some(
-          (structuredElement) =>
-            structuredElement !== element &&
-            structuredElement.contains(element)
-        )
+        isFullyCoveredByFlow(element, flowCoverage) ||
+        hasAncestorIn(element, flowElements) ||
+        hasAncestorIn(element, structuredTextElements, false)
       ) {
         continue;
       }
@@ -104,14 +143,17 @@
         structured,
         preserveLayout: structured
       });
+      collectedElements += 1;
     }
 
     candidates = dedupeCandidatePlacements(
       removeAncestorConflicts(candidates)
     );
-    const candidateElements = candidates
-      .filter((item) => item.targetType !== "flow")
-      .map((item) => item.target);
+    const candidateElements = new Set(
+      candidates
+        .filter((item) => item.targetType !== "flow")
+        .map((item) => item.target)
+    );
     const flowNodes = new Set(
       flowCandidates.flatMap((candidate) => candidate.nodes)
     );
@@ -127,9 +169,7 @@
         if (
           flowNodes.has(textNode) ||
           !parent ||
-          candidateElements.some(
-            (element) => element === parent || element.contains(parent)
-          )
+          hasAncestorIn(parent, candidateElements)
         ) {
           continue;
         }
@@ -149,7 +189,36 @@
         break;
       }
     }
-    return dedupeCandidatePlacements(candidates).slice(0, limit);
+    return sortByDocumentOrder(
+      dedupeCandidatePlacements(candidates)
+    ).slice(0, limit);
+  }
+
+  // 候选是分三批拼起来的：先 flow，再 element/heading，最后裸文本节点。
+  // 直接 slice 就等于把这个拼装顺序当成了优先级——页面顶部的大标题会
+  // 输给页面底部带内联链接的列表项（flow 候选往往成百上千）。按文档顺序
+  // 排一次再截断，配额就落在“用户先读到的内容”上。未超配额时排序不改变
+  // 结果集，只影响顺序。
+  function sortByDocumentOrder(candidates) {
+    return candidates
+      .map((candidate, index) => ({ candidate, index }))
+      .sort((a, b) => {
+        const aNode = placementIdentity(a.candidate);
+        const bNode = placementIdentity(b.candidate);
+        if (aNode === bNode) {
+          return a.index - b.index;
+        }
+        const relation = aNode.compareDocumentPosition(bNode);
+        if (relation & Node.DOCUMENT_POSITION_FOLLOWING) {
+          return -1;
+        }
+        if (relation & Node.DOCUMENT_POSITION_PRECEDING) {
+          return 1;
+        }
+        // 互不包含也无先后（例如已脱离文档）：保持原有相对顺序。
+        return a.index - b.index;
+      })
+      .map((entry) => entry.candidate);
   }
 
   function collectContentRoots() {
@@ -166,6 +235,20 @@
       return topLevelMatches;
     }
     return document.body ? [document.body] : [];
+  }
+
+  // 临时诊断用：正文根是什么、里面有多少 p / div，用来判断段落是否
+  // 落在 primarySelector 覆盖范围内。定位完可删除。
+  function describeContentRoots() {
+    return collectContentRoots()
+      .map((root) => {
+        const name = root.tagName.toLowerCase();
+        const id = root.id ? `#${root.id}` : "";
+        return `${name}${id}(p:${root.querySelectorAll("p").length},` +
+          `div:${root.querySelectorAll("div").length},` +
+          `li:${root.querySelectorAll("li").length})`;
+      })
+      .join(" | ");
   }
 
   function dedupeCandidatePlacements(candidates) {
@@ -213,6 +296,115 @@
     return [...new Set([...exactMatches, ...fallbackMatches])];
   }
 
+  // flow 候选的 target 是容器本身（blockquote、只含内联子节点的 div 等），
+  // 这些容器同时也可能进入元素候选，同一段正文就会被翻译两遍。只有当
+  // flow 已经吃掉容器里全部有效子节点时才跳过元素候选——如果 flow 只覆盖
+  // 了其中一段（例如靠 <br><br> 分段的容器），剩下的仍要交给元素候选。
+  function buildFlowCoverage(flowCandidates) {
+    const coverage = new Map();
+    for (const candidate of flowCandidates) {
+      let nodes = coverage.get(candidate.target);
+      if (!nodes) {
+        nodes = new Set();
+        coverage.set(candidate.target, nodes);
+      }
+      for (const node of candidate.nodes) {
+        nodes.add(node);
+      }
+    }
+    return coverage;
+  }
+
+  function isFullyCoveredByFlow(element, coverage) {
+    const covered = coverage.get(element);
+    if (!covered) {
+      return false;
+    }
+    for (const node of element.childNodes) {
+      if (
+        node.nodeType !== Node.TEXT_NODE &&
+        node.nodeType !== Node.ELEMENT_NODE
+      ) {
+        continue;
+      }
+      if (!normalizeText(node.textContent)) {
+        continue;
+      }
+      if (!covered.has(node)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // X 的文章编辑器把每个段落渲染成 div > span > span[data-text]：页面里
+  // 一个 <p> 都没有，文本节点也不是块容器的直接子节点，primarySelector 和
+  // collectDirectTextNodes 都够不着。这里把“子节点全是内联元素/文本的块级
+  // 容器”本身当作一段正文，补上这类富文本编辑器渲染的页面。
+  function collectInlineTextBlocks(root) {
+    const blocks = [];
+    for (const element of root.querySelectorAll("div, section, li")) {
+      // 裸 div 的数量远大于 <p>，没有下限就会把计数、按钮文案这类 UI
+      // 碎片也当成正文。这里沿用 flow 候选和结构化回退的同一个阈值。
+      // 只做长度粗筛，用 textContent 而非 innerText，避免强制回流。
+      // 长度筛必须排在 isInlineTextBlock 之前：后者要 getComputedStyle，
+      // 而整页的 div 里绝大多数在这一步就被刷掉了。
+      const text = normalizeText(element.textContent);
+      if (text.length < INLINE_TEXT_BLOCK_MIN_LENGTH) {
+        continue;
+      }
+      if (isInlineTextBlock(element)) {
+        blocks.push(element);
+      }
+    }
+    return blocks;
+  }
+
+  function isInlineTextBlock(element) {
+    // 先用标签名快速排除含块级子元素的包装层，避免对整页每个 div 都
+    // 调用 getComputedStyle（大页面上这一步会成为瓶颈）。
+    for (const child of element.children) {
+      // 含 <br> 的容器可能是靠换行分段的（一个容器多段正文），
+      // 那是 collectFlowCandidates 的活，这里不越权合并成一段。
+      if (child.tagName === "BR" || BLOCK_LEVEL_TAGS.has(child.tagName)) {
+        return false;
+      }
+    }
+    const display = window.getComputedStyle(element).display;
+    if (
+      display !== "block" &&
+      display !== "flow-root" &&
+      display !== "list-item"
+    ) {
+      return false;
+    }
+
+    let hasText = false;
+    for (const node of element.childNodes) {
+      if (node.nodeType === Node.TEXT_NODE) {
+        if (normalizeText(node.textContent)) {
+          hasText = true;
+        }
+        continue;
+      }
+      if (node.nodeType !== Node.ELEMENT_NODE) {
+        continue;
+      }
+      const childDisplay = window.getComputedStyle(node).display;
+      if (
+        childDisplay !== "inline" &&
+        childDisplay !== "inline-block" &&
+        childDisplay !== "contents"
+      ) {
+        return false;
+      }
+      if (normalizeText(node.textContent)) {
+        hasText = true;
+      }
+    }
+    return hasText;
+  }
+
   function collectFlowCandidates(root) {
     const candidates = [];
     const containers = [
@@ -221,11 +413,15 @@
     ];
 
     for (const container of containers) {
+      // 三次 closest 各自向上走一遍祖先链，合成一个选择器只走一遍。
+      if (container.closest(EXCLUDED_CONTAINER_SELECTOR)) {
+        continue;
+      }
+      // flush() 只在 run 里含链接、且至少两个节点时才产出候选。这两个
+      // 条件都不成立的容器，下面对每个子节点的 getComputedStyle 是白做的。
       if (
-        container.closest(`[${MARKER}]`) ||
-        container.closest(
-          "script, style, noscript, code, pre, svg, canvas, iframe, textarea, input, select, [contenteditable='true'], [aria-hidden='true'], nav, header, footer, aside"
-        )
+        container.childNodes.length < 2 ||
+        !container.querySelector("a")
       ) {
         continue;
       }
@@ -299,46 +495,81 @@
   }
 
   function removeOverlappingFlows(candidates) {
+    // 一个候选自己的 nodes 全是 target 的子节点，谁都不会包含 target，
+    // 所以不必再排除 other !== candidate：命中的一定是别的 flow。
+    const flowElementNodes = new Set();
+    for (const candidate of candidates) {
+      for (const node of candidate.nodes) {
+        if (node.nodeType === Node.ELEMENT_NODE) {
+          flowElementNodes.add(node);
+        }
+      }
+    }
     return candidates.filter(
-      (candidate) =>
-        !candidates.some(
-          (other) =>
-            other !== candidate &&
-            other.nodes.some(
-              (node) =>
-                node.nodeType === Node.ELEMENT_NODE &&
-                node.contains(candidate.target)
-            )
-        )
+      (candidate) => !hasAncestorIn(candidate.target, flowElementNodes)
     );
   }
 
+  // 丢弃“套着别的普通候选”的外层元素，避免同一段正文翻两遍。判定条件：
+  // 候选的子树里还有别的非 flow 候选，或者它被某个结构化候选罩住。
+  // 原实现是候选两两 contains（候选上限 limit*3 时约 40 万次 DOM 调用），
+  // 这里改成一次自底向上的祖先标记，规模从 O(n²) 降到 O(n × 树深)。
   function removeAncestorConflicts(candidates) {
-    return candidates.filter(
-      (candidate) => {
-        if (candidate.targetType === "flow") {
-          return true;
-        }
-        if (candidate.structured) {
-          return true;
-        }
-        return !candidates.some(
-          (other) =>
-            other !== candidate &&
-            other.targetType !== "flow" &&
-            (other.structured
-              ? other.target.contains(candidate.target) ||
-                candidate.target.contains(other.target)
-              : candidate.target.contains(other.target))
-        );
+    const targetCounts = new Map();
+    const structuredTargets = new Set();
+    for (const candidate of candidates) {
+      if (candidate.targetType === "flow") {
+        continue;
       }
-    );
+      targetCounts.set(
+        candidate.target,
+        (targetCounts.get(candidate.target) || 0) + 1
+      );
+      if (candidate.structured) {
+        structuredTargets.add(candidate.target);
+      }
+    }
+
+    const hasNonFlowDescendant = new Set();
+    for (const target of targetCounts.keys()) {
+      for (let node = target.parentElement; node; node = node.parentElement) {
+        // 这个祖先之前被标记时已经一路向上标到根，上面无需再走。
+        if (hasNonFlowDescendant.has(node)) {
+          break;
+        }
+        if (targetCounts.has(node)) {
+          hasNonFlowDescendant.add(node);
+        }
+      }
+    }
+
+    return candidates.filter((candidate) => {
+      if (candidate.targetType === "flow" || candidate.structured) {
+        return true;
+      }
+      // 同一个 target 上还挂着另一个非 flow 候选时，原来两者互相 contains
+      // （contains 含自身）会双双出局，这里用计数保持同样的行为。
+      if (targetCounts.get(candidate.target) > 1) {
+        return false;
+      }
+      return (
+        !hasNonFlowDescendant.has(candidate.target) &&
+        !hasAncestorIn(candidate.target, structuredTargets, false)
+      );
+    });
   }
 
   function isEligible(element, root, primarySelector) {
+    // 标题的译文块是插在标题“后面”的兄弟节点，不在 [MARKER] 子树内，
+    // 只查 MARKER 会让它在下一轮扫描里被当成新正文再翻一遍。
+    // 同理，flow 译文块是插在容器“里面”的，closest 只往上找，会让容器
+    // （比如带行内链接的 <li>）在下一轮扫描里被整段再翻一遍。
     if (
       element.hasAttribute(MARKER) ||
+      element.hasAttribute(OWNED_MARKER) ||
       element.closest(`[${MARKER}]`) ||
+      element.closest(`[${OWNED_MARKER}]`) ||
+      element.querySelector(`[${MARKER}], [${OWNED_MARKER}]`) ||
       element.closest(
         "script, style, noscript, code, pre, svg, canvas, iframe, textarea, input, select, [contenteditable='true'], [aria-hidden='true']"
       )
@@ -396,12 +627,7 @@
     ];
 
     for (const element of elements) {
-      if (
-        element.closest(`[${MARKER}]`) ||
-        element.closest(
-          "script, style, noscript, code, pre, svg, canvas, iframe, textarea, input, select, [contenteditable='true'], [aria-hidden='true'], nav, header, footer, aside"
-        )
-      ) {
+      if (element.closest(EXCLUDED_CONTAINER_SELECTOR)) {
         continue;
       }
 

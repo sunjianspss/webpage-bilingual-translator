@@ -59,9 +59,6 @@
     ko: /[\uac00-\ud7af]/
   };
   let taskGeneration = 0;
-  // 预热批只是为了给冷启动的本地模型留出加载时间：一旦本页已经成功拿到
-  // 过一次译文，模型必然是热的，再串行等一整个往返就是纯浪费。
-  let backendWarmedUp = false;
   let persistentCacheWriteChain = Promise.resolve();
   const persistentCachePendingWrites = new Map();
   let activeSession = null;

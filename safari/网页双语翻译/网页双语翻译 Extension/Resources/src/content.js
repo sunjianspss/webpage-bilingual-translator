@@ -67,9 +67,6 @@
     ko: /[\uac00-\ud7af]/
   };
   let taskGeneration = 0;
-  // 预热批只是为了给冷启动的本地模型留出加载时间：一旦本页已经成功拿到
-  // 过一次译文，模型必然是热的，再串行等一整个往返就是纯浪费。
-  let backendWarmedUp = false;
   let persistentCacheWriteChain = Promise.resolve();
   const persistentCachePendingWrites = new Map();
   let activeSession = null;
@@ -735,8 +732,12 @@
       : LOCAL_TRANSLATION_BATCH_CONCURRENCY;
   }
 
+  // 预热批看着像“串行等一个往返的浪费”，实测正相反：它刻意做得很小
+  // （LOCAL_FIRST_BATCH_SEGMENT_LIMIT=5），本地 qwen3.5-35b 上约 2.9s 就回来，
+  // 首句译文立刻上屏；跳过它让小批去和满批抢并发，首句退到 6.8s，而总
+  // 时长毫无改善（37.2s vs 36.9s）。每轮扫描都值得留着。
   function shouldWarmupFirstBatch(settings) {
-    return settings?.backend !== "deepseek" && !backendWarmedUp;
+    return settings?.backend !== "deepseek";
   }
 
   async function requestTranslationBatch(batch, taskId) {
@@ -755,7 +756,6 @@
         });
         assertCurrentTask(taskId);
         if (response?.ok) {
-          backendWarmedUp = true;
           return response;
         }
         const responseError = new Error(response?.error || lastError);

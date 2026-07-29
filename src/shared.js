@@ -71,10 +71,50 @@ function extractTranslationPayload(content) {
     : sliceJson(text, "{", "}");
 }
 
+// 模型照着输入形状回、把外层壳丢掉的方式不止一种：单片段批次的输入只有
+// 一项，它常直接回一个裸的 {id,text}，也见过回 {"1":"译文"} 这种 id→文本
+// 映射。这类批次拆无可拆（translateWithFallback 对单片段直接抛出），接不住
+// 就是那一段正文永久丢失，所以宁可把形状认全。
+function toTranslationItems(parsed) {
+  if (Array.isArray(parsed)) {
+    return parsed;
+  }
+  if (!parsed || typeof parsed !== "object") {
+    return null;
+  }
+  if (Array.isArray(parsed.translations)) {
+    return parsed.translations;
+  }
+  if (isTranslationItem(parsed)) {
+    return [parsed];
+  }
+  if (isTranslationItem(parsed.translations)) {
+    return [parsed.translations];
+  }
+  const entries = Object.entries(parsed);
+  if (
+    entries.length > 0 &&
+    entries.every(([, value]) => typeof value === "string")
+  ) {
+    return entries.map(([id, text]) => ({ id, text }));
+  }
+  return null;
+}
+
+function isTranslationItem(value) {
+  return Boolean(
+    value &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    (typeof value.id === "string" || typeof value.id === "number") &&
+    typeof value.text === "string"
+  );
+}
+
 export function parseTranslations(content, expectedSegments) {
   const parsed = extractTranslationPayload(content);
-  const items = Array.isArray(parsed) ? parsed : parsed?.translations;
-  if (!Array.isArray(items)) {
+  const items = toTranslationItems(parsed);
+  if (!items) {
     throw new Error("模型返回缺少 translations 数组");
   }
 

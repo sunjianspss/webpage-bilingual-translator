@@ -245,3 +245,55 @@ function makeBenchmarkBatches(segments, limits) {
   }
   return batches;
 }
+
+// 单片段批次拆无可拆（translateWithFallback 对 length<=1 直接抛出），模型
+// 把外层壳丢掉时若接不住，那一段正文就永久丢失。真实日志里见过
+// "segments=1 chars=1110 code=MODEL_OUTPUT 模型返回缺少 translations 数组"。
+test("accepts a bare single object from single-segment batches", () => {
+  assert.deepEqual(
+    parseTranslations(
+      '{"id":"1","text":"我的主要担忧是"}',
+      [{ id: "1", text: "My primary concern" }]
+    ),
+    { 1: "我的主要担忧是" }
+  );
+  assert.deepEqual(
+    parseTranslations(
+      '```json\n{"id":"1","text":"我的主要担忧是"}\n```',
+      [{ id: "1", text: "My primary concern" }]
+    ),
+    { 1: "我的主要担忧是" }
+  );
+  // 数字 id 也认
+  assert.deepEqual(
+    parseTranslations(
+      '{"id":1,"text":"我的主要担忧是"}',
+      [{ id: "1", text: "My primary concern" }]
+    ),
+    { 1: "我的主要担忧是" }
+  );
+});
+
+test("accepts an id-to-text map and a single-object translations value", () => {
+  assert.deepEqual(
+    parseTranslations(
+      '{"1":"第一段","2":"第二段"}',
+      [{ id: "1", text: "First" }, { id: "2", text: "Second" }]
+    ),
+    { 1: "第一段", 2: "第二段" }
+  );
+  assert.deepEqual(
+    parseTranslations(
+      '{"translations":{"id":"1","text":"我的主要担忧是"}}',
+      [{ id: "1", text: "My primary concern" }]
+    ),
+    { 1: "我的主要担忧是" }
+  );
+});
+
+test("still rejects payloads that carry no usable translation", () => {
+  assert.throws(
+    () => parseTranslations('{"error":{"code":500}}', [{ id: "1", text: "x" }]),
+    /模型返回缺少 translations 数组/
+  );
+});

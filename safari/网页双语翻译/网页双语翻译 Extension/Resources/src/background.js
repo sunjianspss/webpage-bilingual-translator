@@ -26,6 +26,10 @@ const LANGUAGE_NAMES = Object.freeze({
 
 const TRANSLATE_COMMAND = "translate-current-page";
 const TRANSLATION_REQUEST_TIMEOUT_MS = 45_000;
+// service worker 空闲会被回收，而单个翻译请求最长允许 45s。SW 在响应发出
+// 前被杀，content 侧只会收到 "message channel closed"，整批译文丢失。
+// 定期触碰一次扩展 API 可以重置空闲计时器。
+const SERVICE_WORKER_KEEPALIVE_MS = 20_000;
 const TRANSLATION_JOB_STORAGE_PREFIX = "translatorTranslationJob:";
 const SAFARI_NATIVE_HOST = "com.sun.webpagetranslator";
 const translationJobs = new Map();
@@ -663,10 +667,38 @@ function abortError() {
   return error;
 }
 
+let keepAliveHolders = 0;
+let keepAliveTimer = null;
+
+function acquireServiceWorkerKeepAlive() {
+  keepAliveHolders += 1;
+  if (keepAliveTimer !== null) {
+    return;
+  }
+  keepAliveTimer = setInterval(() => {
+    try {
+      chrome.runtime?.getPlatformInfo?.()?.catch?.(() => {});
+    } catch (_error) {
+      // 保活失败不该影响翻译本身。
+    }
+  }, SERVICE_WORKER_KEEPALIVE_MS);
+}
+
+function releaseServiceWorkerKeepAlive() {
+  keepAliveHolders = Math.max(0, keepAliveHolders - 1);
+  if (keepAliveHolders > 0 || keepAliveTimer === null) {
+    return;
+  }
+  clearInterval(keepAliveTimer);
+  keepAliveTimer = null;
+}
+
 function createRequestControl(jobSignal) {
   const controller = new AbortController();
   let timedOut = false;
   const abortFromJob = () => controller.abort();
+  // 请求存续期间保活，cleanup() 由 finally 保证一定会跑。
+  acquireServiceWorkerKeepAlive();
 
   if (jobSignal.aborted) {
     abortFromJob();
@@ -684,6 +716,7 @@ function createRequestControl(jobSignal) {
     cleanup() {
       clearTimeout(timeoutId);
       jobSignal.removeEventListener("abort", abortFromJob);
+      releaseServiceWorkerKeepAlive();
     }
   };
 }
@@ -742,6 +775,45 @@ function chatCompletionsUrl(baseUrl) {
     : `${normalized}/chat/completions`;
 }
 
+// 模型照着输入形状回、把外层壳丢掉的方式不止一种：单片段批次的输入只有
+// 一项，它常直接回一个裸的 {id,text}，也见过回 {"1":"译文"} 这种 id→文本
+// 映射。这类批次拆无可拆，接不住就是那一段正文永久丢失。
+function toTranslationItems(parsed) {
+  if (Array.isArray(parsed)) {
+    return parsed;
+  }
+  if (!parsed || typeof parsed !== "object") {
+    return null;
+  }
+  if (Array.isArray(parsed.translations)) {
+    return parsed.translations;
+  }
+  if (isTranslationItem(parsed)) {
+    return [parsed];
+  }
+  if (isTranslationItem(parsed.translations)) {
+    return [parsed.translations];
+  }
+  const entries = Object.entries(parsed);
+  if (
+    entries.length > 0 &&
+    entries.every(([, value]) => typeof value === "string")
+  ) {
+    return entries.map(([id, text]) => ({ id, text }));
+  }
+  return null;
+}
+
+function isTranslationItem(value) {
+  return Boolean(
+    value &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    (typeof value.id === "string" || typeof value.id === "number") &&
+    typeof value.text === "string"
+  );
+}
+
 function parseTranslations(content, expectedSegments) {
   const withoutFence = String(content || "")
     .trim()
@@ -761,8 +833,8 @@ function parseTranslations(content, expectedSegments) {
     throw new Error("模型没有返回可识别的 JSON");
   }
   const parsed = JSON.parse(withoutFence.slice(start, end + 1));
-  const items = Array.isArray(parsed) ? parsed : parsed?.translations;
-  if (!Array.isArray(items)) {
+  const items = toTranslationItems(parsed);
+  if (!items) {
     throw new Error("模型返回缺少 translations 数组");
   }
 

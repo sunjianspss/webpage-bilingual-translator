@@ -237,20 +237,6 @@
     return document.body ? [document.body] : [];
   }
 
-  // 临时诊断用：正文根是什么、里面有多少 p / div，用来判断段落是否
-  // 落在 primarySelector 覆盖范围内。定位完可删除。
-  function describeContentRoots() {
-    return collectContentRoots()
-      .map((root) => {
-        const name = root.tagName.toLowerCase();
-        const id = root.id ? `#${root.id}` : "";
-        return `${name}${id}(p:${root.querySelectorAll("p").length},` +
-          `div:${root.querySelectorAll("div").length},` +
-          `li:${root.querySelectorAll("li").length})`;
-      })
-      .join(" | ");
-  }
-
   function dedupeCandidatePlacements(candidates) {
     const seenTargets = new Set();
     const seenFlowStarts = new Set();

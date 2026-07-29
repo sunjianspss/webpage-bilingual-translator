@@ -9,6 +9,12 @@ import {
 
 const TRANSLATE_COMMAND = "translate-current-page";
 const TRANSLATION_REQUEST_TIMEOUT_MS = 45_000;
+// MV3 的 service worker 空闲 30s 就会被回收，而单个翻译请求最长允许 45s，
+// 提高并发后单批往返本身也变长（本地模型上从 11s 涨到 27s）。SW 一旦在
+// fetch 返回前被杀，content 侧那条 sendMessage 只会收到
+// "message channel closed before a response was received"，整批译文丢失。
+// 定期调一次扩展 API 可以重置空闲计时器，这是 MV3 下保活的通行做法。
+const SERVICE_WORKER_KEEPALIVE_MS = 20_000;
 const TRANSLATION_JOB_STORAGE_PREFIX = "translatorTranslationJob:";
 const translationJobs = new Map();
 let translationJobStateQueue = Promise.resolve();
@@ -497,10 +503,38 @@ async function requestTranslations(segments, settings, jobSignal) {
   }
 }
 
+let keepAliveHolders = 0;
+let keepAliveTimer = null;
+
+function acquireServiceWorkerKeepAlive() {
+  keepAliveHolders += 1;
+  if (keepAliveTimer !== null) {
+    return;
+  }
+  keepAliveTimer = setInterval(() => {
+    try {
+      chrome.runtime?.getPlatformInfo?.()?.catch?.(() => {});
+    } catch (_error) {
+      // 保活失败不该影响翻译本身。
+    }
+  }, SERVICE_WORKER_KEEPALIVE_MS);
+}
+
+function releaseServiceWorkerKeepAlive() {
+  keepAliveHolders = Math.max(0, keepAliveHolders - 1);
+  if (keepAliveHolders > 0 || keepAliveTimer === null) {
+    return;
+  }
+  clearInterval(keepAliveTimer);
+  keepAliveTimer = null;
+}
+
 function createRequestControl(jobSignal) {
   const controller = new AbortController();
   let timedOut = false;
   const abortFromJob = () => controller.abort();
+  // 请求存续期间保活，cleanup() 已由 finally 保证一定会跑，配对是安全的。
+  acquireServiceWorkerKeepAlive();
 
   if (jobSignal.aborted) {
     abortFromJob();
@@ -518,6 +552,7 @@ function createRequestControl(jobSignal) {
     cleanup() {
       clearTimeout(timeoutId);
       jobSignal.removeEventListener("abort", abortFromJob);
+      releaseServiceWorkerKeepAlive();
     }
   };
 }

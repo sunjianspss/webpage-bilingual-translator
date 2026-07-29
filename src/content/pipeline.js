@@ -61,8 +61,6 @@
     }
 
     session.scanRunning = true;
-    const stats = createScanStats(session);
-    session.scanStats = stats;
     try {
       const settings = session.settings;
       const rawCollected = collectCandidates(
@@ -73,9 +71,6 @@
         (placement) =>
           !isAlreadyTargetLanguage(placement.text, settings.targetLanguage)
       );
-      stats.collected = rawCollected.length;
-      stats.skippedTargetLanguage =
-        rawCollected.length - collected.length;
       let availableNewPlacements = remaining;
       const placements = collected.filter((placement) => {
         if (session.countedTargets.has(placementIdentity(placement))) {
@@ -87,7 +82,6 @@
         availableNewPlacements -= 1;
         return true;
       });
-      recordPlacementTypes(stats, placements);
       if (placements.length === 0) {
         return { discovered: 0, failures: [] };
       }
@@ -107,12 +101,10 @@
       showTranslationProgress(session);
 
       const groups = await groupCandidatePlacements(placements, session);
-      stats.groups = groups.length;
       assertCurrentTask(session.taskId);
       for (const group of groups) {
         const cached = session.translationCache.get(group.key);
         if (cached) {
-          stats.cacheHits += 1;
           applyTranslatedGroup(session, group, cached);
         }
       }
@@ -120,11 +112,9 @@
       const candidates = groups
         .filter((group) => !group.applied)
         .flatMap((group) => group.fragments);
-      stats.segments = candidates.length;
       let batchFailures = [];
       if (candidates.length > 0) {
         const batches = makeBatches(candidates, settings);
-        stats.batches = batches.length;
         batchFailures = await translateCandidateBatches(
           batches,
           getTranslationBatchConcurrency(settings),
@@ -135,7 +125,6 @@
             for (const candidate of batch) {
               const translatedText = response.translations[candidate.id];
               if (!translatedText) {
-                stats.missingTranslations += 1;
                 continue;
               }
               candidate.group.translations.set(
@@ -170,10 +159,7 @@
       }
 
       assertCurrentTask(session.taskId);
-      recordUnappliedGroups(stats, groups);
-      recordBatchErrors(stats, batchFailures);
       const failedPlacements = countFailedPlacements(batchFailures);
-      stats.failedPlacements = failedPlacements;
       const hasFailures = failedPlacements > 0;
       state = {
         ...state,
@@ -196,165 +182,8 @@
       return { discovered: placements.length, failures: batchFailures };
     } finally {
       session.scanRunning = false;
-      session.scanStats = null;
-      logScanDiagnostics(session, stats);
     }
   }
-
-  // ==== 临时诊断（定位“只翻译了一小部分”）====================
-  // 每轮扫描输出一行 [双语翻译诊断]，把“采集到多少 / 过滤掉多少 /
-  // 发了几批 / 落地成功多少 / 各类丢失多少”摊开。定位完可整块删除，
-  // 并移除 pipeline.js 中对 stats 的赋值。
-  function createScanStats(session) {
-    return {
-      startedAt: Date.now(),
-      usedAtStart: session.usedPlacements,
-      collected: 0,
-      skippedTargetLanguage: 0,
-      placements: 0,
-      byType: {},
-      groups: 0,
-      cacheHits: 0,
-      segments: 0,
-      batches: 0,
-      missingTranslations: 0,
-      appliedPlacements: 0,
-      applyFailedDetached: 0,
-      applyFailedMarked: 0,
-      limitSkipped: 0,
-      unappliedGroups: 0,
-      unappliedSamples: [],
-      duplicatedTails: [],
-      batchErrors: [],
-      failedPlacements: 0
-    };
-  }
-
-  function recordPlacementTypes(stats, placements) {
-    stats.placements = placements.length;
-    for (const placement of placements) {
-      const kind = placement.structured
-        ? "structured"
-        : placement.targetType;
-      stats.byType[kind] = (stats.byType[kind] || 0) + 1;
-      recordDuplicatedTail(stats, placement);
-    }
-  }
-
-  // 定位“链接文字在段末被重复一遍”：找出正文里结尾片段在前文已出现过
-  // 的 placement，连同它的类型、目标标签和直接子节点一起打出来。
-  function recordDuplicatedTail(stats, placement) {
-    const tail = findDuplicatedTail(placement.text);
-    if (!tail || stats.duplicatedTails.length >= 4) {
-      return;
-    }
-    const target = placement.target;
-    const element = target?.nodeType === Node.ELEMENT_NODE
-      ? target
-      : target?.parentElement;
-    stats.duplicatedTails.push({
-      类型: placement.targetType,
-      目标: element
-        ? `${element.tagName.toLowerCase()}[${
-          window.getComputedStyle(element).display
-        }]`
-        : String(target?.nodeName || ""),
-      重复片段: tail,
-      正文长度: placement.text.length,
-      flow节点: (placement.nodes || []).map((node) =>
-        node.nodeType === Node.ELEMENT_NODE
-          ? node.tagName.toLowerCase()
-          : "#text"
-      ),
-      目标子节点: element
-        ? [...element.childNodes].map((node) =>
-          node.nodeType === Node.ELEMENT_NODE
-            ? node.tagName.toLowerCase()
-            : "#text"
-        )
-        : []
-    });
-  }
-
-  function findDuplicatedTail(text) {
-    const normalized = String(text || "").trim();
-    for (let length = 40; length >= 12; length -= 4) {
-      if (normalized.length < length * 2) {
-        continue;
-      }
-      const tail = normalized.slice(-length);
-      if (normalized.slice(0, -length).includes(tail)) {
-        return tail;
-      }
-    }
-    return "";
-  }
-
-  function recordUnappliedGroups(stats, groups) {
-    for (const group of groups) {
-      if (group.applied) {
-        continue;
-      }
-      stats.unappliedGroups += 1;
-      if (stats.unappliedSamples.length < 3) {
-        stats.unappliedSamples.push(group.text.slice(0, 60));
-      }
-    }
-  }
-
-  function recordBatchErrors(stats, failures) {
-    for (const failure of failures) {
-      stats.batchErrors.push({
-        segments: failure.batch.length,
-        code: failure.error?.code || "",
-        message:
-          failure.error instanceof Error
-            ? failure.error.message
-            : String(failure.error)
-      });
-    }
-  }
-
-  function logScanDiagnostics(session, stats) {
-    if (!stats) {
-      return;
-    }
-    // 这个函数是在 finally 里调用的：诊断自身抛异常会顶掉真正的错误。
-    try {
-      writeScanDiagnostics(session, stats);
-    } catch (_error) {
-      // 诊断失败不影响翻译本身。
-    }
-  }
-
-  function writeScanDiagnostics(session, stats) {
-    console.info("[双语翻译诊断]", {
-      页面: location.href,
-      正文根: describeContentRoots(),
-      耗时毫秒: Date.now() - stats.startedAt,
-      后端: session.settings.backend,
-      上限maxSegments: session.maxPlacements,
-      "1_采集到": stats.collected,
-      "2_已是目标语言跳过": stats.skippedTargetLanguage,
-      "3_本轮候选": stats.placements,
-      "3b_候选类型": stats.byType,
-      "3c_正文含重复片段": stats.duplicatedTails,
-      "4_去重后分组": stats.groups,
-      "4b_命中缓存": stats.cacheHits,
-      "5_待翻译片段": stats.segments,
-      "5b_请求批次": stats.batches,
-      "6_模型漏译片段": stats.missingTranslations,
-      "7_落地成功": stats.appliedPlacements,
-      "7a_落地失败_节点已断开": stats.applyFailedDetached,
-      "7b_落地失败_已被标记": stats.applyFailedMarked,
-      "7c_超出上限跳过": stats.limitSkipped,
-      "8_始终没拿到译文的分组": stats.unappliedGroups,
-      "8b_样例": stats.unappliedSamples,
-      "9_失败批次": stats.batchErrors,
-      "9b_计入失败的位置数": stats.failedPlacements
-    });
-  }
-  // ==== 临时诊断结束 =========================================
 
   async function groupCandidatePlacements(placements, session) {
     const groupsByKey = new Map();
@@ -404,9 +233,8 @@
       return;
     }
     let newPlacements = 0;
-    const stats = session.scanStats;
     withObserverPaused(session, () => {
-      for (const [index, placement] of group.placements.entries()) {
+      for (const placement of group.placements) {
         const identity = placementIdentity(placement);
         const alreadyCounted = session.countedTargets.has(
           identity
@@ -416,9 +244,6 @@
           session.usedPlacements + newPlacements >=
             session.maxPlacements
         ) {
-          if (stats) {
-            stats.limitSkipped += group.placements.length - index;
-          }
           break;
         }
         if (
@@ -430,21 +255,13 @@
             placement.nodes
           )
         ) {
-          if (stats) {
-            stats.appliedPlacements += 1;
-          }
           session.pendingRetranslationTargets.delete(placement.target);
           if (!alreadyCounted) {
             session.countedTargets.add(identity);
             newPlacements += 1;
           }
         } else if (!placement.target.isConnected) {
-          if (stats) {
-            stats.applyFailedDetached += 1;
-          }
           session.pendingRetranslationTargets.delete(placement.target);
-        } else if (stats) {
-          stats.applyFailedMarked += 1;
         }
       }
     });
@@ -555,8 +372,12 @@
       : LOCAL_TRANSLATION_BATCH_CONCURRENCY;
   }
 
+  // 预热批看着像“串行等一个往返的浪费”，实测正相反：它刻意做得很小
+  // （LOCAL_FIRST_BATCH_SEGMENT_LIMIT=5），本地 qwen3.5-35b 上约 2.9s 就回来，
+  // 首句译文立刻上屏；跳过它让小批去和满批抢并发，首句退到 6.8s，而总
+  // 时长毫无改善（37.2s vs 36.9s）。每轮扫描都值得留着。
   function shouldWarmupFirstBatch(settings) {
-    return settings?.backend !== "deepseek" && !backendWarmedUp;
+    return settings?.backend !== "deepseek";
   }
 
   async function requestTranslationBatch(batch, taskId) {
@@ -575,7 +396,6 @@
         });
         assertCurrentTask(taskId);
         if (response?.ok) {
-          backendWarmedUp = true;
           return response;
         }
         const responseError = new Error(response?.error || lastError);
@@ -592,14 +412,6 @@
           throw error;
         }
         lastError = error instanceof Error ? error.message : String(error);
-        // 临时诊断：把每次批次请求失败的原因打出来（超时 / 模型格式 /
-        // 连接失败），定位完可删除。
-        console.warn(
-          `[双语翻译诊断] 批次请求失败 attempt=${attempt} ` +
-          `segments=${batch.length} chars=${
-            batch.reduce((total, item) => total + item.text.length, 0)
-          } code=${error?.code || ""} ${lastError}`
-        );
       }
 
       if (attempt === 0) {

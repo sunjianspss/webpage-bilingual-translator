@@ -1122,3 +1122,45 @@ test("a rescan does not re-translate a list item that already holds a translatio
     "the rescan must add one block for the new paragraph and none for the list item"
   );
 });
+
+// maxSegments 用尽时，谁被丢下不能取决于候选数组的拼装顺序。flow 候选
+// （带内联链接的段落/列表项）是第一批入队的，真实站点里动辄成百上千；
+// 直接 slice 会让页面顶部的大标题输给页面底部的列表项。
+test("a binding placement budget keeps the top of the document, not whatever was collected first", async (t) => {
+  const linkedItems = Array.from(
+    { length: 40 },
+    (_, index) =>
+      `<li>Linked list entry ${index} citing <a href="/r${index}">an inline source link</a> plus trailing prose long enough to count as body copy.</li>`
+  ).join("");
+  const harness = createHarness({
+    html: `
+      <main>
+        <h1>Lead headline: the most important line on this page</h1>
+        <p>Lead paragraph sitting at the very top of the document.</p>
+        <ul>${linkedItems}</ul>
+      </main>
+    `
+  });
+  t.after(harness.close);
+
+  harness.start({ maxSegments: 5 });
+  const state = await waitForTerminalState(harness);
+  assert.equal(state.status, "done", state.error);
+
+  const requested = harness.requestedSegments().map(({ text }) => text);
+  assert.ok(
+    requested.some((text) => text.includes("Lead headline")),
+    "the headline at the top of the document must fit inside the budget"
+  );
+  assert.ok(
+    requested.some((text) => text.includes("Lead paragraph")),
+    "the lead paragraph at the top of the document must fit inside the budget"
+  );
+
+  const heading = harness.document.querySelector("h1");
+  assert.equal(
+    heading.nextElementSibling?.dataset.translatorForHeading,
+    "true",
+    "the headline must actually receive its translation block"
+  );
+});

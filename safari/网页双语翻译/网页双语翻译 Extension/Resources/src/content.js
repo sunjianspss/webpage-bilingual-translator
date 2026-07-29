@@ -1278,8 +1278,15 @@
     const flowCoverage = buildFlowCoverage(flowCandidates);
     let candidates = [...flowCandidates];
 
+    // 这个上限是用来兜住超大页面的采集开销的，只应约束本循环自己的产出。
+    // 原来它比的是 candidates.length，而数组里已经躺着全部 flow 候选：
+    // 带内联链接的列表项一多（真实站点里很常见），元素循环会在第一次
+    // 迭代就 break，页面顶部的标题和正文根本没被采集，后面再怎么排序都
+    // 救不回来。
+    let collectedElements = 0;
+
     for (const element of elements) {
-      if (candidates.length >= limit * 3) {
+      if (collectedElements >= limit * 3) {
         break;
       }
       if (
@@ -1321,6 +1328,7 @@
         structured,
         preserveLayout: structured
       });
+      collectedElements += 1;
     }
 
     candidates = dedupeCandidatePlacements(
@@ -1366,7 +1374,36 @@
         break;
       }
     }
-    return dedupeCandidatePlacements(candidates).slice(0, limit);
+    return sortByDocumentOrder(
+      dedupeCandidatePlacements(candidates)
+    ).slice(0, limit);
+  }
+
+  // 候选是分三批拼起来的：先 flow，再 element/heading，最后裸文本节点。
+  // 直接 slice 就等于把这个拼装顺序当成了优先级——页面顶部的大标题会
+  // 输给页面底部带内联链接的列表项（flow 候选往往成百上千）。按文档顺序
+  // 排一次再截断，配额就落在“用户先读到的内容”上。未超配额时排序不改变
+  // 结果集，只影响顺序。
+  function sortByDocumentOrder(candidates) {
+    return candidates
+      .map((candidate, index) => ({ candidate, index }))
+      .sort((a, b) => {
+        const aNode = placementIdentity(a.candidate);
+        const bNode = placementIdentity(b.candidate);
+        if (aNode === bNode) {
+          return a.index - b.index;
+        }
+        const relation = aNode.compareDocumentPosition(bNode);
+        if (relation & Node.DOCUMENT_POSITION_FOLLOWING) {
+          return -1;
+        }
+        if (relation & Node.DOCUMENT_POSITION_PRECEDING) {
+          return 1;
+        }
+        // 互不包含也无先后（例如已脱离文档）：保持原有相对顺序。
+        return a.index - b.index;
+      })
+      .map((entry) => entry.candidate);
   }
 
   function collectContentRoots() {

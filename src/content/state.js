@@ -49,6 +49,7 @@
   // 这样长推文仍可整体翻译而不会被静默跳过。
   const STRUCTURED_TEXT_MAX_LENGTH = 4000;
   const MUTATION_SCAN_DEBOUNCE_MS = 120;
+  const FAILURE_REASON_MAX_LENGTH = 60;
   const PERSISTENT_CACHE_KEY_PREFIX = "aiPageTranslatorCache:";
   const PERSISTENT_CACHE_INDEX_KEY = "aiPageTranslatorCacheIndex";
   const PERSISTENT_CACHE_MAX_ENTRIES = 3000;
@@ -101,6 +102,16 @@
           })
         );
       return true;
+    }
+
+    // 快捷键翻译时弹窗没有打开，后台的失败原因没有别的地方可去；
+    // 不接住它，用户按下快捷键就只会看到“什么都没发生”。
+    if (message?.type === "SHOW_TRANSLATION_ERROR") {
+      const errorText = String(message.error || "翻译失败");
+      state = { ...state, status: "error", error: errorText };
+      showStatus(errorText, "error");
+      sendResponse({ ok: true, state });
+      return false;
     }
 
     if (message?.type === "TRANSLATE_PAGE") {

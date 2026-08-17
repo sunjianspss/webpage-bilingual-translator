@@ -3,12 +3,16 @@ import {
   buildTranslationMessages,
   chatCompletionsUrl,
   estimateTranslationMaxTokens,
+  modelsUrl,
+  normalizeBaseUrl,
   parseTranslations,
   translateWithFallback
 } from "./shared.js";
 
 const TRANSLATE_COMMAND = "translate-current-page";
 const TRANSLATION_REQUEST_TIMEOUT_MS = 45_000;
+// 探活只是一次本地 GET，慢到 5s 还没回来的服务，整页翻译也没法用。
+const BACKEND_PROBE_TIMEOUT_MS = 5_000;
 // MV3 的 service worker 空闲 30s 就会被回收，而单个翻译请求最长允许 45s，
 // 提高并发后单批往返本身也变长（本地模型上从 11s 涨到 27s）。SW 一旦在
 // fetch 返回前被杀，content 侧那条 sendMessage 只会收到
@@ -19,6 +23,7 @@ const TRANSLATION_JOB_STORAGE_PREFIX = "translatorTranslationJob:";
 const translationJobs = new Map();
 let translationJobStateQueue = Promise.resolve();
 const JOB_MESSAGE_TYPES = new Set([
+  "CHECK_TRANSLATION_BACKEND",
   "CREATE_TRANSLATION_JOB",
   "TRANSLATE_BATCH",
   "CANCEL_TRANSLATION_JOB",
@@ -64,6 +69,11 @@ chrome.tabs?.onReplaced?.addListener?.((_addedTabId, removedTabId) => {
 });
 
 async function handleJobMessage(message, sender) {
+  if (message.type === "CHECK_TRANSLATION_BACKEND") {
+    await checkTranslationBackend(message.settings);
+    return { ok: true };
+  }
+
   if (message.type === "CREATE_TRANSLATION_JOB") {
     const job = await createTranslationJob(
       message.settings,
@@ -338,22 +348,38 @@ async function translateActiveTabFromCommand() {
     target: { tabId: tab.id },
     files: ["src/content.js"]
   });
-  const job = await createTranslationJob(
-    await loadTranslatorSettings(),
-    tab.id
-  );
   try {
-    const response = await chrome.tabs.sendMessage(tab.id, {
-      type: "TRANSLATE_PAGE",
-      jobId: job.jobId,
-      pageSettings: job.pageSettings
-    });
-    if (!response?.ok) {
-      throw new Error(response?.error || "翻译失败");
+    const settings = await loadTranslatorSettings();
+    await checkTranslationBackend(settings);
+    const job = await createTranslationJob(settings, tab.id);
+    try {
+      const response = await chrome.tabs.sendMessage(tab.id, {
+        type: "TRANSLATE_PAGE",
+        jobId: job.jobId,
+        pageSettings: job.pageSettings
+      });
+      if (!response?.ok) {
+        throw new Error(response?.error || "翻译失败");
+      }
+    } catch (error) {
+      await disposeTranslationJob(job.jobId);
+      throw error;
     }
   } catch (error) {
-    await disposeTranslationJob(job.jobId);
+    // 快捷键路径没有弹窗可以显示错误，只能把原因送回页面的状态条。
+    await showTranslationErrorInTab(tab.id, error);
     throw error;
+  }
+}
+
+async function showTranslationErrorInTab(tabId, error) {
+  try {
+    await chrome.tabs.sendMessage(tabId, {
+      type: "SHOW_TRANSLATION_ERROR",
+      error: error instanceof Error ? error.message : String(error)
+    });
+  } catch (_sendError) {
+    // 页面可能已经跳走或没接上内容脚本，调用方仍会把错误写进控制台。
   }
 }
 
@@ -380,6 +406,99 @@ function pageSettings(settings) {
     viewMode: settings.viewMode,
     maxSegments: settings.maxSegments
   };
+}
+
+// 本地服务没起来是这个扩展最常见的失败原因（LM Studio 的 server 开关被关、
+// 端口改了、模型名和实际加载的对不上）。以前它只能表现成几十个批次全部
+// fetch 失败，界面上只剩一句“N 处失败”——原因全丢了，还白等一整轮。
+// 开翻前先花一次 /models 往返，把这类问题在第一秒就说清楚。
+async function checkTranslationBackend(settings) {
+  const merged = Object.freeze({
+    ...DEFAULT_SETTINGS,
+    ...(settings || {})
+  });
+  // DeepSeek 的失败本身就带 HTTP 状态码和服务端的错误说明，够清楚了，
+  // 不值得为它多付一次跨公网往返。
+  if (merged.backend === "deepseek") {
+    return;
+  }
+
+  const baseUrl = normalizeBaseUrl(merged.localBaseUrl);
+  if (!baseUrl) {
+    throw new Error("请填写本地 API 地址");
+  }
+  const model = merged.localModel?.trim();
+  if (!model) {
+    throw new Error("请填写模型名称");
+  }
+
+  const headers = {};
+  if (merged.localApiKey?.trim()) {
+    headers.Authorization = `Bearer ${merged.localApiKey.trim()}`;
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(
+    () => controller.abort(),
+    BACKEND_PROBE_TIMEOUT_MS
+  );
+  let response;
+  try {
+    response = await fetch(modelsUrl(baseUrl), {
+      method: "GET",
+      headers,
+      signal: controller.signal
+    });
+  } catch (_error) {
+    throw codedError(
+      `无法连接本地翻译服务 ${baseUrl}，请确认 LM Studio 等服务已启动`,
+      "LOCAL_BACKEND_UNREACHABLE"
+    );
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
+  if (response.status === 401 || response.status === 403) {
+    throw codedError(
+      "本地翻译服务要求身份验证，请在扩展中填写 API Token",
+      "LOCAL_BACKEND_UNAUTHORIZED"
+    );
+  }
+  // 服务活着但没实现 /models 也很正常，这种情况不该挡住翻译，
+  // 真出问题时正式请求会带回自己的错误。
+  if (!response.ok) {
+    return;
+  }
+
+  const availableModels = await readModelIds(response);
+  if (availableModels.length > 0 && !hasModel(availableModels, model)) {
+    throw codedError(
+      `本地服务里没有模型 ${model}，当前可用：${availableModels
+        .slice(0, 3)
+        .join("、")}`,
+      "LOCAL_MODEL_NOT_FOUND"
+    );
+  }
+}
+
+async function readModelIds(response) {
+  try {
+    const payload = await response.json();
+    const items = Array.isArray(payload?.data) ? payload.data : [];
+    return items
+      .map((item) => item?.id)
+      .filter((id) => typeof id === "string" && id.length > 0);
+  } catch {
+    return [];
+  }
+}
+
+// Ollama 把标签算进模型 id（llama3:latest），用户通常只填 llama3。
+// 名字对得上就放行，宁可漏报也不要拦住一次本来能成的翻译。
+function hasModel(availableModels, model) {
+  return availableModels.some(
+    (id) => id === model || id.startsWith(`${model}:`)
+  );
 }
 
 async function requestTranslations(segments, settings, jobSignal) {

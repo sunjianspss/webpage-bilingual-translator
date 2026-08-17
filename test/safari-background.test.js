@@ -237,3 +237,30 @@ test("Safari native handler uses a locked task registry and removes completed ta
   assert.match(content, /case "CANCEL_HTTP_REQUEST"/);
   assert.match(content, /Self\.taskRegistry\.remove\(requestId\)/);
 });
+
+test("Safari probes the local backend through the native host, not fetch", async () => {
+  fetchCalls = 0;
+  nativeMessages.length = 0;
+  const nativeStarted = waitForNativeRequest();
+  const checkResponse = dispatch({
+    type: "CHECK_TRANSLATION_BACKEND",
+    settings: translatorSettings()
+  });
+  const probeRequest = await nativeStarted;
+
+  assert.equal(probeRequest.type, "HTTP_REQUEST");
+  assert.equal(probeRequest.method, "GET");
+  assert.equal(probeRequest.url, "http://127.0.0.1:1234/v1/models");
+
+  pendingNativeRequests.get(probeRequest.requestId).resolve({
+    ok: true,
+    status: 200,
+    payload: { data: [{ id: "some-other-model" }] }
+  });
+
+  const checked = await checkResponse;
+  assert.equal(checked.ok, false);
+  assert.equal(checked.code, "LOCAL_MODEL_NOT_FOUND");
+  assert.match(checked.error, /some-other-model/);
+  assert.equal(fetchCalls, 0);
+});

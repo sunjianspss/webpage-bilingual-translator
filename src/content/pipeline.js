@@ -6,6 +6,7 @@
     let foundCandidates = false;
 
     let totalFailures = 0;
+    let failureReason = "";
     try {
       for (const delay of rescanDelays) {
         if (delay > 0) {
@@ -15,22 +16,26 @@
         const result = await translateCurrentCandidates(session);
         foundCandidates = foundCandidates || result.discovered > 0;
         totalFailures += countFailedPlacements(result.failures);
+        failureReason = failureReason || describeFailures(result.failures);
       }
     } finally {
       session.initializing = false;
     }
 
     const hasFailures = totalFailures > 0;
+    const reasonSuffix = hasFailures ? failureSuffix(failureReason) : "";
     state = {
       ...state,
       status: hasFailures ? "error" : "done",
       translated: session.usedPlacements,
       total: session.usedPlacements,
-      error: hasFailures ? `${totalFailures} 处内容翻译失败` : ""
+      error: hasFailures
+        ? `${totalFailures} 处内容翻译失败${reasonSuffix}`
+        : ""
     };
     showStatus(
       hasFailures
-        ? `已翻译 ${session.usedPlacements} 处内容，${totalFailures} 处失败`
+        ? `已翻译 ${session.usedPlacements} 处内容，${totalFailures} 处失败${reasonSuffix}`
         : foundCandidates
           ? `已翻译 ${session.usedPlacements} 处内容`
           : "暂未发现正文，正在监听动态内容",
@@ -161,18 +166,21 @@
       assertCurrentTask(session.taskId);
       const failedPlacements = countFailedPlacements(batchFailures);
       const hasFailures = failedPlacements > 0;
+      const reasonSuffix = hasFailures
+        ? failureSuffix(describeFailures(batchFailures))
+        : "";
       state = {
         ...state,
         status: hasFailures ? "error" : "done",
         translated: session.usedPlacements,
         total: session.usedPlacements,
         error: hasFailures
-          ? `${failedPlacements} 处内容翻译失败`
+          ? `${failedPlacements} 处内容翻译失败${reasonSuffix}`
           : ""
       };
       showStatus(
         hasFailures
-          ? `已翻译 ${session.usedPlacements} 处内容，${failedPlacements} 处失败`
+          ? `已翻译 ${session.usedPlacements} 处内容，${failedPlacements} 处失败${reasonSuffix}`
           : `已翻译 ${session.usedPlacements} 处内容`,
         hasFailures ? "error" : "success"
       );
@@ -356,6 +364,29 @@
       total += group.placements.length;
     }
     return total;
+  }
+
+  // 只报数量，用户没法区分“本地服务没开”和“模型输出格式错”——两种都长成
+  // 一句“N 处失败”。取第一条失败原因跟在后面；状态条只有一行，太长的截断。
+  function describeFailures(failures) {
+    for (const failure of failures) {
+      const message =
+        failure?.error instanceof Error
+          ? failure.error.message
+          : String(failure?.error ?? "");
+      const text = message.trim();
+      if (!text) {
+        continue;
+      }
+      return text.length > FAILURE_REASON_MAX_LENGTH
+        ? `${text.slice(0, FAILURE_REASON_MAX_LENGTH)}…`
+        : text;
+    }
+    return "";
+  }
+
+  function failureSuffix(reason) {
+    return reason ? `：${reason}` : "";
   }
 
   function isFatalBatchError(error) {

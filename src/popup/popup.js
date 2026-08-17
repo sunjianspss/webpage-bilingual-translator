@@ -110,6 +110,7 @@ async function translatePage() {
     await chrome.storage.local.set({
       translatorSettings: settings
     });
+    await checkTranslationBackend(settings);
     const job = await createTranslationJob(settings);
     jobId = job.jobId;
     const response = await sendToPage({
@@ -308,6 +309,18 @@ async function ensureEndpointPermission(baseUrl) {
 function needsEndpointPermission(baseUrl) {
   const url = new URL(baseUrl);
   return url.hostname !== "127.0.0.1" && url.hostname !== "localhost";
+}
+
+// 开翻前先确认后端是活的：本地服务没启动时，这一次往返能在第一秒
+// 给出原因，而不是让几十个批次各自失败后只剩一句“N 处失败”。
+async function checkTranslationBackend(value) {
+  const response = await chrome.runtime.sendMessage({
+    type: "CHECK_TRANSLATION_BACKEND",
+    settings: value
+  });
+  if (!response?.ok) {
+    throw new Error(response?.error || "无法连接翻译服务");
+  }
 }
 
 async function createTranslationJob(value) {

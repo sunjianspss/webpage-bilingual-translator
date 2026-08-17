@@ -38,6 +38,16 @@ export function chatCompletionsUrl(baseUrl) {
     : `${normalized}/chat/completions`;
 }
 
+// 开翻前的探活用的是同一个 base URL 下的 /models：OpenAI 兼容服务基本都
+// 实现它，而且它不会加载模型、不产生 token，代价只有一次本地往返。
+export function modelsUrl(baseUrl) {
+  const normalized = normalizeBaseUrl(baseUrl);
+  if (!normalized) {
+    throw new Error("API 地址不能为空");
+  }
+  return `${normalized.replace(/\/chat\/completions$/, "")}/models`;
+}
+
 export function extractJsonObject(content) {
   return sliceJson(stripCodeFence(content), "{", "}");
 }

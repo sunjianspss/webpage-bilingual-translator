@@ -26,6 +26,8 @@ const LANGUAGE_NAMES = Object.freeze({
 
 const TRANSLATE_COMMAND = "translate-current-page";
 const TRANSLATION_REQUEST_TIMEOUT_MS = 45_000;
+// 探活只是一次本地 GET，慢到 5s 还没回来的服务，整页翻译也没法用。
+const BACKEND_PROBE_TIMEOUT_MS = 5_000;
 // service worker 空闲会被回收，而单个翻译请求最长允许 45s。SW 在响应发出
 // 前被杀，content 侧只会收到 "message channel closed"，整批译文丢失。
 // 定期触碰一次扩展 API 可以重置空闲计时器。
@@ -35,6 +37,7 @@ const SAFARI_NATIVE_HOST = "com.sun.webpagetranslator";
 const translationJobs = new Map();
 let translationJobStateQueue = Promise.resolve();
 const JOB_MESSAGE_TYPES = new Set([
+  "CHECK_TRANSLATION_BACKEND",
   "CREATE_TRANSLATION_JOB",
   "TRANSLATE_BATCH",
   "CANCEL_TRANSLATION_JOB",
@@ -80,6 +83,11 @@ chrome.tabs?.onReplaced?.addListener?.((_addedTabId, removedTabId) => {
 });
 
 async function handleJobMessage(message, sender) {
+  if (message.type === "CHECK_TRANSLATION_BACKEND") {
+    await checkTranslationBackend(message.settings);
+    return { ok: true };
+  }
+
   if (message.type === "CREATE_TRANSLATION_JOB") {
     const job = await createTranslationJob(
       message.settings,
@@ -354,22 +362,38 @@ async function translateActiveTabFromCommand() {
     target: { tabId: tab.id },
     files: ["src/content.js"]
   });
-  const job = await createTranslationJob(
-    await loadTranslatorSettings(),
-    tab.id
-  );
   try {
-    const response = await chrome.tabs.sendMessage(tab.id, {
-      type: "TRANSLATE_PAGE",
-      jobId: job.jobId,
-      pageSettings: job.pageSettings
-    });
-    if (!response?.ok) {
-      throw new Error(response?.error || "翻译失败");
+    const settings = await loadTranslatorSettings();
+    await checkTranslationBackend(settings);
+    const job = await createTranslationJob(settings, tab.id);
+    try {
+      const response = await chrome.tabs.sendMessage(tab.id, {
+        type: "TRANSLATE_PAGE",
+        jobId: job.jobId,
+        pageSettings: job.pageSettings
+      });
+      if (!response?.ok) {
+        throw new Error(response?.error || "翻译失败");
+      }
+    } catch (error) {
+      await disposeTranslationJob(job.jobId);
+      throw error;
     }
   } catch (error) {
-    await disposeTranslationJob(job.jobId);
+    // 快捷键路径没有弹窗可以显示错误，只能把原因送回页面的状态条。
+    await showTranslationErrorInTab(tab.id, error);
     throw error;
+  }
+}
+
+async function showTranslationErrorInTab(tabId, error) {
+  try {
+    await chrome.tabs.sendMessage(tabId, {
+      type: "SHOW_TRANSLATION_ERROR",
+      error: error instanceof Error ? error.message : String(error)
+    });
+  } catch (_sendError) {
+    // 页面可能已经跳走或没接上内容脚本，调用方仍会把错误写进控制台。
   }
 }
 
@@ -396,6 +420,104 @@ function pageSettings(settings) {
     viewMode: settings.viewMode,
     maxSegments: settings.maxSegments
   };
+}
+
+// 本地服务没起来是这个扩展最常见的失败原因（服务开关被关、端口改了、
+// 模型名和实际加载的对不上）。以前它只能表现成几十个批次全部失败，界面上
+// 只剩一句“N 处失败”。开翻前先花一次 /models 往返，把原因说清楚。
+async function checkTranslationBackend(settings) {
+  const merged = Object.freeze({
+    ...DEFAULT_SETTINGS,
+    ...(settings || {})
+  });
+  // DeepSeek 的失败本身就带 HTTP 状态码和服务端说明，不值得多付一次
+  // 跨公网往返。
+  if (merged.backend === "deepseek") {
+    return;
+  }
+
+  const baseUrl = normalizeBaseUrl(merged.localBaseUrl);
+  if (!baseUrl) {
+    throw new Error("请填写本地 API 地址");
+  }
+  const model = merged.localModel?.trim();
+  if (!model) {
+    throw new Error("请填写模型名称");
+  }
+
+  const headers = {};
+  if (merged.localApiKey?.trim()) {
+    headers.Authorization = `Bearer ${merged.localApiKey.trim()}`;
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(
+    () => controller.abort(),
+    BACKEND_PROBE_TIMEOUT_MS
+  );
+  let result;
+  try {
+    result = await requestThroughSafari(
+      {
+        type: "HTTP_REQUEST",
+        url: modelsUrl(baseUrl),
+        method: "GET",
+        headers
+      },
+      controller.signal
+    );
+  } catch (_error) {
+    throw codedError(
+      `无法连接本地翻译服务 ${baseUrl}，请确认本地服务已启动`,
+      "LOCAL_BACKEND_UNREACHABLE"
+    );
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
+  const status = Number(result?.status) || 0;
+  if (status === 401 || status === 403) {
+    throw codedError(
+      "本地翻译服务要求身份验证，请在扩展中填写 API Token",
+      "LOCAL_BACKEND_UNAUTHORIZED"
+    );
+  }
+  // 原生代理连不上时既没有 ok 也没有状态码，这才是“服务没起来”。
+  if (!result?.ok && status === 0) {
+    throw codedError(
+      `无法连接本地翻译服务 ${baseUrl}，请确认本地服务已启动`,
+      "LOCAL_BACKEND_UNREACHABLE"
+    );
+  }
+  // 服务活着但没实现 /models 也很正常，不该挡住翻译。
+  if (!result?.ok) {
+    return;
+  }
+
+  const availableModels = readModelIds(result.payload);
+  if (availableModels.length > 0 && !hasModel(availableModels, model)) {
+    throw codedError(
+      `本地服务里没有模型 ${model}，当前可用：${availableModels
+        .slice(0, 3)
+        .join("、")}`,
+      "LOCAL_MODEL_NOT_FOUND"
+    );
+  }
+}
+
+function readModelIds(payload) {
+  const items = Array.isArray(payload?.data) ? payload.data : [];
+  return items
+    .map((item) => item?.id)
+    .filter((id) => typeof id === "string" && id.length > 0);
+}
+
+// Ollama 把标签算进模型 id（llama3:latest），用户通常只填 llama3。
+// 名字对得上就放行，宁可漏报也不要拦住一次本来能成的翻译。
+function hasModel(availableModels, model) {
+  return availableModels.some(
+    (id) => id === model || id.startsWith(`${model}:`)
+  );
 }
 
 async function requestTranslations(segments, settings, jobSignal) {
@@ -765,14 +887,26 @@ function errorResponse(error) {
   return response;
 }
 
+function normalizeBaseUrl(baseUrl) {
+  return String(baseUrl || "").trim().replace(/\/+$/, "");
+}
+
 function chatCompletionsUrl(baseUrl) {
-  const normalized = String(baseUrl || "").trim().replace(/\/+$/, "");
+  const normalized = normalizeBaseUrl(baseUrl);
   if (!normalized) {
     throw new Error("API 地址不能为空");
   }
   return normalized.endsWith("/chat/completions")
     ? normalized
     : `${normalized}/chat/completions`;
+}
+
+function modelsUrl(baseUrl) {
+  const normalized = normalizeBaseUrl(baseUrl);
+  if (!normalized) {
+    throw new Error("API 地址不能为空");
+  }
+  return `${normalized.replace(/\/chat\/completions$/, "")}/models`;
 }
 
 // 模型照着输入形状回、把外层壳丢掉的方式不止一种：单片段批次的输入只有

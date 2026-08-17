@@ -10,6 +10,7 @@ let tabRemovedListener;
 let storageReads = 0;
 let storedSettings = {};
 let fetchMode = "success";
+let respondToProbe = () => modelsResponse([]);
 let fetchStarted;
 let resolveFetchStarted;
 const requests = [];
@@ -76,6 +77,9 @@ globalThis.chrome = {
 
 globalThis.fetch = async (url, options) => {
   requests.push({ url, options });
+  if (String(url).endsWith("/models")) {
+    return respondToProbe();
+  }
   resolveFetchStarted?.(options.signal);
 
   if (fetchMode === "pending") {
@@ -419,4 +423,109 @@ test("translation jobs survive an MV3 service-worker restart", async () => {
   });
   assert.deepEqual(released, { ok: true });
   assert.equal(hasPersistedJob(created.jobId), false);
+});
+
+function modelsResponse(ids, status = 200) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    async json() {
+      return { object: "list", data: ids.map((id) => ({ id })) };
+    }
+  };
+}
+
+test("the backend probe names the reason a local service cannot be reached", async (t) => {
+  t.after(() => {
+    respondToProbe = () => modelsResponse([]);
+  });
+  respondToProbe = () => {
+    throw new TypeError("Failed to fetch");
+  };
+
+  const checked = await dispatch({
+    type: "CHECK_TRANSLATION_BACKEND",
+    settings: translatorSettings()
+  });
+
+  assert.equal(checked.ok, false);
+  assert.equal(checked.code, "LOCAL_BACKEND_UNREACHABLE");
+  assert.match(checked.error, /http:\/\/127\.0\.0\.1:1234\/v1/);
+  assert.equal(requests.at(-1).url, "http://127.0.0.1:1234/v1/models");
+  assert.equal(requests.at(-1).options.method, "GET");
+});
+
+test("the backend probe catches a model name the service has not loaded", async (t) => {
+  t.after(() => {
+    respondToProbe = () => modelsResponse([]);
+  });
+  respondToProbe = () => modelsResponse(["qwen/qwen3.5-35b-a3b"]);
+
+  const rejected = await dispatch({
+    type: "CHECK_TRANSLATION_BACKEND",
+    settings: translatorSettings({ localModel: "not-loaded" })
+  });
+
+  assert.equal(rejected.ok, false);
+  assert.equal(rejected.code, "LOCAL_MODEL_NOT_FOUND");
+  assert.match(rejected.error, /qwen\/qwen3\.5-35b-a3b/);
+
+  const accepted = await dispatch({
+    type: "CHECK_TRANSLATION_BACKEND",
+    settings: translatorSettings({ localModel: "qwen/qwen3.5-35b-a3b" })
+  });
+
+  assert.deepEqual(accepted, { ok: true });
+});
+
+// Ollama 报出来的 id 带标签（llama3:latest），用户填的是 llama3。
+// 探活拦住这种写法就是在拦住一次本来能成的翻译。
+test("the backend probe accepts an Ollama model written without its tag", async (t) => {
+  t.after(() => {
+    respondToProbe = () => modelsResponse([]);
+  });
+  respondToProbe = () => modelsResponse(["llama3:latest"]);
+
+  const checked = await dispatch({
+    type: "CHECK_TRANSLATION_BACKEND",
+    settings: translatorSettings({ localModel: "llama3" })
+  });
+
+  assert.deepEqual(checked, { ok: true });
+});
+
+test("the backend probe stays out of the way when it cannot judge", async (t) => {
+  t.after(() => {
+    respondToProbe = () => modelsResponse([]);
+  });
+  // 服务活着但没实现 /models：拦下来只会挡住一次本来能成的翻译。
+  respondToProbe = () => modelsResponse([], 404);
+
+  const missingEndpoint = await dispatch({
+    type: "CHECK_TRANSLATION_BACKEND",
+    settings: translatorSettings()
+  });
+
+  assert.deepEqual(missingEndpoint, { ok: true });
+
+  respondToProbe = () => modelsResponse([], 401);
+  const unauthorized = await dispatch({
+    type: "CHECK_TRANSLATION_BACKEND",
+    settings: translatorSettings()
+  });
+
+  assert.equal(unauthorized.ok, false);
+  assert.equal(unauthorized.code, "LOCAL_BACKEND_UNAUTHORIZED");
+});
+
+test("the backend probe spends no round trip on DeepSeek", async () => {
+  const requestCount = requests.length;
+
+  const checked = await dispatch({
+    type: "CHECK_TRANSLATION_BACKEND",
+    settings: translatorSettings({ backend: "deepseek" })
+  });
+
+  assert.deepEqual(checked, { ok: true });
+  assert.equal(requests.length, requestCount);
 });

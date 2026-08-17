@@ -790,8 +790,13 @@ test("a failed batch reports every paragraph it lost, not just one", async (t) =
   );
   assert.match(
     state.error,
-    new RegExp(`^${paragraphs.length} 处内容翻译失败$`),
+    new RegExp(`^${paragraphs.length} 处内容翻译失败`),
     "the count must be the number of untranslated paragraphs, not failed batches"
+  );
+  assert.match(
+    state.error,
+    /模型返回缺少 translations 数组/,
+    "the count alone cannot tell a dead backend from a bad model response"
   );
 });
 

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## v0.1.5 - 2026-08-19
+
+### Added
+
 - Added local backend detection to the popup. A Chrome extension cannot look for
   where LM Studio is installed the way a desktop app can, so this asks a short
   fixed list of known ports (LM Studio, Ollama, llama.cpp, vLLM, Jan) whether an
@@ -14,11 +18,6 @@
   reasons that are hard to trace.
 - Detection tells a service that is running with no model loaded apart from a
   service that is not running, because the fix differs.
-
-## v0.1.4 - 2026-08-19
-
-### Added
-
 - Added a downloadable extension package to each release, so installing no
   longer means cloning the repository and loading its root as an unpacked
   extension.

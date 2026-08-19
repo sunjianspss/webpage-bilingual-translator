@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Added `PRIVACY.md`, stating what leaves the browser, what is kept in extension
+  storage, and why each permission is requested. Required for a Chrome Web Store
+  listing, and the port probing added in v0.1.5 is the kind of behavior a policy
+  has to name.
+- Added tests that pin the policy to the code: the probed ports, the cache cap,
+  the default endpoint and every declared permission must match, and a new
+  external host anywhere in the shipped code fails the suite.
+
 ## v0.1.5 - 2026-08-19
 
 ### Added

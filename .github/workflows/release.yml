@@ -1,0 +1,45 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+
+      # --expect-version 让 tag 成为唯一的发布指令:tag 和 manifest.json 对不
+      # 上就在这里停下,而不是发出一个版本号写错的商店包。
+      - name: Build store package
+        run: npm run package -- --expect-version=${{ github.ref_name }}
+
+      # 仓库已有 docs/releases/vX.Y.Z.md 的惯例,有就用它当发布说明,
+      # 没有就让 GitHub 按提交记录自动生成。
+      #
+      # 建成草稿而不是直接发布:草稿只有协作者可见,可以先下载 zip 装一遍确认
+      # 没问题再点 Publish,跑砸了删掉草稿重来也不会有人看到半成品。
+      - name: Create draft GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          notes_file="docs/releases/${TAG}.md"
+          if [ -f "$notes_file" ]; then
+            gh release create "$TAG" dist/*.zip --draft \
+              --title "$TAG" --notes-file "$notes_file"
+          else
+            gh release create "$TAG" dist/*.zip --draft \
+              --title "$TAG" --generate-notes
+          fi

@@ -33,12 +33,21 @@
         <div id="local-fields">
           <label class="field">
             <span>API 地址</span>
-            <input
-              id="local-base-url"
-              type="url"
-              spellcheck="false"
-              placeholder="http://127.0.0.1:1234/v1"
-            >
+            <div class="field-row">
+              <input
+                id="local-base-url"
+                type="url"
+                spellcheck="false"
+                placeholder="http://127.0.0.1:1234/v1"
+              >
+              <button
+                type="button"
+                class="secondary compact-button"
+                id="detect-local"
+              >
+                自动检测
+              </button>
+            </div>
           </label>
           <label class="field">
             <span>模型</span>
@@ -46,8 +55,10 @@
               id="local-model"
               type="text"
               spellcheck="false"
+              list="local-model-options"
               placeholder="qwen/qwen3.5-35b-a3b"
             >
+            <datalist id="local-model-options"></datalist>
           </label>
           <label class="field">
             <span>API Key <small>可选</small></span>

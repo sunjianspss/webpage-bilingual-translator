@@ -4,6 +4,9 @@ import {
   chatCompletionsUrl,
   estimateTranslationMaxTokens,
   modelsUrl,
+  chatModelIds,
+  LOCAL_BACKEND_CANDIDATES,
+  LOCAL_BACKEND_DETECT_TIMEOUT_MS,
   normalizeBaseUrl,
   parseTranslations,
   translateWithFallback
@@ -24,6 +27,7 @@ const translationJobs = new Map();
 let translationJobStateQueue = Promise.resolve();
 const JOB_MESSAGE_TYPES = new Set([
   "CHECK_TRANSLATION_BACKEND",
+  "DETECT_LOCAL_BACKENDS",
   "CREATE_TRANSLATION_JOB",
   "TRANSLATE_BATCH",
   "CANCEL_TRANSLATION_JOB",
@@ -72,6 +76,11 @@ async function handleJobMessage(message, sender) {
   if (message.type === "CHECK_TRANSLATION_BACKEND") {
     await checkTranslationBackend(message.settings);
     return { ok: true };
+  }
+
+  if (message.type === "DETECT_LOCAL_BACKENDS") {
+    const backends = await detectLocalBackends(message.apiKey);
+    return { ok: true, backends };
   }
 
   if (message.type === "CREATE_TRANSLATION_JOB") {
@@ -478,6 +487,51 @@ async function checkTranslationBackend(settings) {
         .join("、")}`,
       "LOCAL_MODEL_NOT_FOUND"
     );
+  }
+}
+
+// 同时打所有候选端口。串行的话没人监听的端口要各等一次超时,五个端口
+// 最坏要等 7.5s;并行之后整体就是最慢的那一个。
+async function detectLocalBackends(apiKey) {
+  const results = await Promise.all(
+    LOCAL_BACKEND_CANDIDATES.map((candidate) =>
+      probeLocalBackendCandidate(candidate, apiKey)
+    )
+  );
+  return results.filter((result) => result !== null);
+}
+
+async function probeLocalBackendCandidate(candidate, apiKey) {
+  const headers = {};
+  if (apiKey?.trim()) {
+    headers.Authorization = `Bearer ${apiKey.trim()}`;
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(
+    () => controller.abort(),
+    LOCAL_BACKEND_DETECT_TIMEOUT_MS
+  );
+  try {
+    const response = await fetch(modelsUrl(candidate.baseUrl), {
+      method: "GET",
+      headers,
+      signal: controller.signal
+    });
+    if (!response.ok) {
+      return null;
+    }
+    // 模型列表为空也照样返回:LM Studio 开着但没加载模型就是这个形状,
+    // 报"在运行但没加载模型"比报"没找到服务"有用得多。
+    return {
+      baseUrl: candidate.baseUrl,
+      label: candidate.label,
+      models: chatModelIds(await readModelIds(response))
+    };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeoutId);
   }
 }
 

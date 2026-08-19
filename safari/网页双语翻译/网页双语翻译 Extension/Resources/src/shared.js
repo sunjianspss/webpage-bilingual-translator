@@ -24,6 +24,29 @@ export const LANGUAGE_NAMES = Object.freeze({
   es: "Español"
 });
 
+// 自动检测只探这张写死的短名单,不做端口遍历:逐个端口试探属于扫描行为,
+// 商店审核会盯,而且大多数端口上什么都没有,白等超时。
+export const LOCAL_BACKEND_CANDIDATES = Object.freeze([
+  Object.freeze({ baseUrl: "http://127.0.0.1:1234/v1", label: "LM Studio" }),
+  Object.freeze({ baseUrl: "http://127.0.0.1:11434/v1", label: "Ollama" }),
+  Object.freeze({ baseUrl: "http://127.0.0.1:8080/v1", label: "llama.cpp" }),
+  Object.freeze({ baseUrl: "http://127.0.0.1:8000/v1", label: "vLLM" }),
+  Object.freeze({ baseUrl: "http://127.0.0.1:1337/v1", label: "Jan" })
+]);
+
+// 探活用的 5s 是"服务在跑但慢"的预算;自动检测同时打 5 个端口,绝大多数
+// 会立刻 ECONNREFUSED,留 1.5s 给真的在监听但启动慢的那个就够了。
+export const LOCAL_BACKEND_DETECT_TIMEOUT_MS = 1_500;
+
+// /models 会把嵌入和重排模型和对话模型混在一起返回(LM Studio 上实测就有
+// text-embedding-nomic-embed-text-v1.5)。把嵌入模型填进"模型"一栏,整页
+// 翻译会失败,而且原因极难查。只过滤 embed / rerank 这两个无歧义的词;
+// 过滤完为空说明这个服务的命名不合套路,退回原列表,总比一个都不给强。
+export function chatModelIds(modelIds) {
+  const filtered = modelIds.filter((id) => !/embed|rerank/i.test(id));
+  return filtered.length > 0 ? filtered : modelIds;
+}
+
 export function normalizeBaseUrl(value) {
   return String(value || "").trim().replace(/\/+$/, "");
 }

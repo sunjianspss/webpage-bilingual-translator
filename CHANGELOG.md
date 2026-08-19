@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Added local backend detection to the popup. A Chrome extension cannot look for
+  where LM Studio is installed the way a desktop app can, so this asks a short
+  fixed list of known ports (LM Studio, Ollama, llama.cpp, vLLM, Jan) whether an
+  OpenAI-compatible service answers there, and fills in the API URL from the
+  first one that does.
+- The model field now offers the detected models as a dropdown. Typing the model
+  name by hand was the most error-prone step in setup, and a name that does not
+  match a loaded model fails the whole page. Embedding and reranker models are
+  kept out of the list, since picking one makes every translation fail for
+  reasons that are hard to trace.
+- Detection tells a service that is running with no model loaded apart from a
+  service that is not running, because the fix differs.
+
 ## v0.1.4 - 2026-08-19
 
 ### Added

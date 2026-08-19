@@ -203,6 +203,7 @@ select:focus {
   color: #1967d2;
 }
 
+.field-row,
 .shortcut-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;

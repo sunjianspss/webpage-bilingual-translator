@@ -10,6 +10,8 @@ const elements = {
   localBaseUrl: document.querySelector("#local-base-url"),
   localModel: document.querySelector("#local-model"),
   localApiKey: document.querySelector("#local-api-key"),
+  detectLocal: document.querySelector("#detect-local"),
+  localModelOptions: document.querySelector("#local-model-options"),
   highQualityReasoning: document.querySelector(
     "#high-quality-reasoning"
   ),
@@ -38,6 +40,12 @@ initialize().catch((error) => setMessage(error.message, "error"));
 elements.backend.addEventListener("change", () => {
   updateBackendVisibility();
   persistForm().catch((error) => setMessage(error.message, "error"));
+});
+
+elements.detectLocal.addEventListener("click", () => {
+  detectLocalBackends().catch((error) =>
+    setMessage(error.message, "error")
+  );
 });
 
 for (const input of [
@@ -309,6 +317,70 @@ async function ensureEndpointPermission(baseUrl) {
 function needsEndpointPermission(baseUrl) {
   const url = new URL(baseUrl);
   return url.hostname !== "127.0.0.1" && url.hostname !== "localhost";
+}
+
+// 扩展没有文件系统，找不到 LM Studio 装在哪；能做的是问几个已知端口
+// 上有没有 OpenAI 兼容服务在应答。顺带把 /models 的结果填进模型下拉，
+// 手打模型名是这个界面上最容易错的一步。
+async function detectLocalBackends() {
+  elements.detectLocal.disabled = true;
+  setMessage("正在检测本地服务…", "");
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: "DETECT_LOCAL_BACKENDS",
+      apiKey: elements.localApiKey.value.trim()
+    });
+    if (!response?.ok) {
+      throw new Error(response?.error || "当前平台不支持自动检测");
+    }
+
+    const backends = response.backends || [];
+    if (backends.length === 0) {
+      setMessage(
+        "没有检测到本地服务，请确认 LM Studio 等已启动并开启了本地服务器",
+        "error"
+      );
+      return;
+    }
+
+    // 有模型的排前面：一个开着但没加载模型的服务，排在能直接用的后面。
+    const ranked = [...backends].sort(
+      (a, b) => b.models.length - a.models.length
+    );
+    const chosen = ranked[0];
+    elements.localBaseUrl.value = chosen.baseUrl;
+    fillModelOptions(chosen.models);
+
+    if (chosen.models.length === 0) {
+      setMessage(
+        `检测到 ${chosen.label}，但它没有加载任何模型`,
+        "error"
+      );
+      return;
+    }
+
+    // 已填的模型如果就在列表里，说明用户填对了，别覆盖他的选择。
+    if (!chosen.models.includes(elements.localModel.value.trim())) {
+      elements.localModel.value = chosen.models[0];
+    }
+    await persistForm();
+
+    const others =
+      ranked.length > 1 ? `，另外还发现 ${ranked.length - 1} 个` : "";
+    setMessage(`已连接 ${chosen.label}${others}`, "success");
+  } finally {
+    elements.detectLocal.disabled = false;
+  }
+}
+
+function fillModelOptions(models) {
+  elements.localModelOptions.replaceChildren(
+    ...models.map((id) => {
+      const option = document.createElement("option");
+      option.value = id;
+      return option;
+    })
+  );
 }
 
 // 开翻前先确认后端是活的：本地服务没启动时，这一次往返能在第一秒

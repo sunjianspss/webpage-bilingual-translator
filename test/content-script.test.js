@@ -225,6 +225,35 @@ test("popup includes shortcut customization controls", async () => {
   assert.match(popup, /chrome\.tabs\.create\(\{ url: SHORTCUTS_URL \}\)/);
 });
 
+test("popup offers local backend detection wired to a model list", async () => {
+  const [html, css, popup] = await Promise.all([
+    readFile(chromePopupHtmlUrl, "utf8"),
+    readFile(chromePopupCssUrl, "utf8"),
+    readFile(chromePopupUrl, "utf8")
+  ]);
+
+  assert.match(html, /id="detect-local"/);
+  assert.match(css, /\.field-row/);
+  assert.match(
+    html,
+    /list="local-model-options"/,
+    "the model input has to offer the detected models"
+  );
+  assert.match(
+    html,
+    /<datalist id="local-model-options">/,
+    "list= pointing at a missing datalist silently does nothing"
+  );
+  assert.match(popup, /type: "DETECT_LOCAL_BACKENDS"/);
+  // Safari 的 background 不认这个消息类型，sendMessage 会解析成 undefined。
+  // 按钮在那里必须给一句人话，而不是抛 "cannot read property of undefined"。
+  assert.match(
+    popup,
+    /当前平台不支持自动检测/,
+    "an unhandled message type must degrade to a readable message"
+  );
+});
+
 test("popup follows translation progress instead of freezing at the first reply", async () => {
   const popup = await readFile(chromePopupUrl, "utf8");
 

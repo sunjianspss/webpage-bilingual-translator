@@ -7,6 +7,7 @@
   "scripts": {
     "test": "node --test",
     "check": "node --check src/background.js && node --check src/content.js && node --check src/popup/popup.js",
+    "package": "node scripts/package.mjs",
     "build-content": "node scripts/build-content.mjs && node scripts/sync-safari.mjs",
     "sync-safari": "node scripts/sync-safari.mjs"
   },

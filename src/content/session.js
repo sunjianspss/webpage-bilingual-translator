@@ -7,7 +7,12 @@
 
     const nextSettings = { ...settings };
     const taskId = ++taskGeneration;
-    clearTranslations(nextSettings.viewMode || state.viewMode);
+    const continuingExistingTranslations = hasCompatibleTranslations(
+      nextSettings.targetLanguage
+    );
+    if (!continuingExistingTranslations) {
+      clearTranslations(nextSettings.viewMode || state.viewMode);
+    }
     ensureStyles();
     setViewMode(nextSettings.viewMode || "bilingual");
 
@@ -43,6 +48,20 @@
     translatePage(session).catch((error) => {
       handleTaskError(session, error);
     });
+  }
+
+  function hasCompatibleTranslations(targetLanguage) {
+    const translations = [
+      ...document.querySelectorAll(`.${TRANSLATION_CLASS}`)
+    ];
+    if (translations.length === 0) {
+      return false;
+    }
+    const normalizedTarget = String(targetLanguage || "").toLowerCase();
+    return translations.every(
+      (translation) =>
+        String(translation.lang || "").toLowerCase() === normalizedTarget
+    );
   }
 
   function handleTaskError(session, error) {

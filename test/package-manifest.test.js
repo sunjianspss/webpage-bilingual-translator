@@ -2,7 +2,12 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 
-import { PACKAGE_FILES, readJson, resolveVersion } from "../scripts/package.mjs";
+import {
+  PACKAGE_FILES,
+  assertValidExtensionVersion,
+  readJson,
+  resolveVersion
+} from "../scripts/package.mjs";
 
 const ROOT = new URL("../", import.meta.url);
 
@@ -72,4 +77,58 @@ test("manifest.json and package.json declare the same version", async () => {
   const { version } = await resolveVersion();
   const manifest = await readJson("manifest.json");
   assert.equal(version, manifest.version);
+});
+
+test("extension versions reject a numeric component above 65535", () => {
+  assert.throws(
+    () => assertValidExtensionVersion("1.65536"),
+    /0-65535/
+  );
+});
+
+test("extension versions cannot consist entirely of zero components", () => {
+  for (const version of ["0", "0.0", "0.0.0", "0.0.0.0"]) {
+    assert.throws(
+      () => assertValidExtensionVersion(version),
+      /不能全为 0/,
+      version
+    );
+  }
+});
+
+test("extension versions accept one to four components through the upper bound", () => {
+  for (const version of [
+    "1",
+    "0.1",
+    "0.0.1",
+    "0.0.0.1",
+    "65535.65535.65535.65535"
+  ]) {
+    assert.doesNotThrow(() => assertValidExtensionVersion(version), version);
+  }
+});
+
+test("extension versions reject non-decimal, padded, or overlong forms", () => {
+  for (const version of [
+    "",
+    "01",
+    "1.01",
+    "1.2.3.4.5",
+    "1.-1",
+    "1.2a",
+    "1e3"
+  ]) {
+    assert.throws(
+      () => assertValidExtensionVersion(version),
+      /1-4 段整数/,
+      version
+    );
+  }
+});
+
+test("extension versions reject a numeric JSON value", () => {
+  assert.throws(
+    () => assertValidExtensionVersion(1),
+    /1-4 段整数/
+  );
 });

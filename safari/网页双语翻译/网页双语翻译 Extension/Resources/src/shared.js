@@ -51,6 +51,14 @@ export function normalizeBaseUrl(value) {
   return String(value || "").trim().replace(/\/+$/, "");
 }
 
+export function endpointPermissionOrigin(baseUrl) {
+  const url = new URL(normalizeBaseUrl(baseUrl));
+  if (url.hostname === "127.0.0.1" || url.hostname === "localhost") {
+    return "";
+  }
+  return `${url.protocol}//${url.host}/*`;
+}
+
 export function chatCompletionsUrl(baseUrl) {
   const normalized = normalizeBaseUrl(baseUrl);
   if (!normalized) {

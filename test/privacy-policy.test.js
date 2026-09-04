@@ -45,6 +45,17 @@ test("the policy does not claim a smaller probe list than the code has", async (
   );
 });
 
+test("the policy explains that blind probes never carry an API token", async () => {
+  const policy = await readFile(policyUrl, "utf8");
+  const section = policy.split("## 三、")[1].split("## 四、")[0];
+
+  assert.match(section, /盲探测请求不携带任何 API Token/);
+  assert.match(
+    section,
+    /API Token 只会发往你明确配置并选择使用的 API 地址/
+  );
+});
+
 test("the disclosed cache cap matches the code", async () => {
   const [policy, state] = await Promise.all([
     readFile(policyUrl, "utf8"),

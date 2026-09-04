@@ -51,12 +51,17 @@
   const MUTATION_SCAN_DEBOUNCE_MS = 120;
   const FAILURE_REASON_MAX_LENGTH = 60;
   const PERSISTENT_CACHE_KEY_PREFIX = "aiPageTranslatorCache:";
-  const PERSISTENT_CACHE_INDEX_KEY = "aiPageTranslatorCacheIndex";
+  const PERSISTENT_CACHE_GENERATION_KEY_PREFIX =
+    "aiPageTranslatorCacheGeneration:";
+  const LEGACY_PERSISTENT_CACHE_INDEX_KEY = "aiPageTranslatorCacheIndex";
   const PERSISTENT_CACHE_MAX_ENTRIES = 3000;
+  // 每个不可变代际标记至少保留一小时；标记到期时回收自身，并淘汰该页
+  // 旧签名下的缓存值，既封住休眠标签页的迟到写入，也避免元数据增长。
+  const PERSISTENT_CACHE_GENERATION_RETENTION_MS = 60 * 60 * 1000;
   const TARGET_LANGUAGE_SCRIPT_PATTERNS = {
-    "zh-CN": /[\u3400-\u9fff]/,
-    "zh-TW": /[\u3400-\u9fff]/,
-    ja: /[\u3040-\u30ff\u3400-\u9fff]/,
+    // 汉字本身无法可靠区分简体、繁体和日语。只在看到目标语言独有的
+    // 书写系统时跳过；拿不准就交给翻译服务，避免静默漏译。
+    ja: /[\u3040-\u30ff]/,
     ko: /[\uac00-\ud7af]/
   };
   let taskGeneration = 0;
@@ -156,4 +161,12 @@
       sendJobMessage("RELEASE_TRANSLATION_JOB", session.jobId);
     }
     activeSession = null;
-  }, { once: true });
+    hideStatus();
+    state = {
+      ...state,
+      status: session.usedPlacements > 0 ? "done" : "idle",
+      translated: session.usedPlacements,
+      total: session.usedPlacements,
+      error: ""
+    };
+  });

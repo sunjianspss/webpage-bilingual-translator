@@ -75,6 +75,11 @@
     const element = node?.nodeType === Node.ELEMENT_NODE
       ? node
       : node?.parentElement;
+    if (
+      element?.closest?.(`.${ORIGINAL_CLASS}`)?.closest?.(`[${MARKER}]`)
+    ) {
+      return false;
+    }
     return Boolean(
       element &&
       (
@@ -97,7 +102,8 @@
         source &&
         (
           source.dataset.translatorTarget === "element" ||
-          source.dataset.translatorTarget === "heading"
+          source.dataset.translatorTarget === "heading" ||
+          source.dataset.translatorTarget === "flow"
         )
       ) {
         sources.add(source);
@@ -109,6 +115,20 @@
 
     withObserverPaused(session, () => {
       for (const source of sources) {
+        if (source.dataset.translatorTarget === "flow") {
+          const container = source.parentNode;
+          const original = source.querySelector(
+            `:scope > .${ORIGINAL_CLASS}`
+          );
+          if (container && original) {
+            while (original.firstChild) {
+              container.insertBefore(original.firstChild, source);
+            }
+            source.remove();
+            session.pendingRetranslationTargets.add(container);
+          }
+          continue;
+        }
         if (source.dataset.translatorTarget === "heading") {
           const translation = source.nextElementSibling;
           if (translation?.dataset.translatorForHeading === "true") {

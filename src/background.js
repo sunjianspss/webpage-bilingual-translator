@@ -2,6 +2,7 @@ import {
   DEFAULT_SETTINGS,
   buildTranslationMessages,
   chatCompletionsUrl,
+  endpointPermissionOrigin,
   estimateTranslationMaxTokens,
   modelsUrl,
   chatModelIds,
@@ -79,7 +80,7 @@ async function handleJobMessage(message, sender) {
   }
 
   if (message.type === "DETECT_LOCAL_BACKENDS") {
-    const backends = await detectLocalBackends(message.apiKey);
+    const backends = await detectLocalBackends();
     return { ok: true, backends };
   }
 
@@ -359,6 +360,7 @@ async function translateActiveTabFromCommand() {
   });
   try {
     const settings = await loadTranslatorSettings();
+    await assertConfiguredEndpointPermission(settings);
     await checkTranslationBackend(settings);
     const job = await createTranslationJob(settings, tab.id);
     try {
@@ -378,6 +380,29 @@ async function translateActiveTabFromCommand() {
     // 快捷键路径没有弹窗可以显示错误，只能把原因送回页面的状态条。
     await showTranslationErrorInTab(tab.id, error);
     throw error;
+  }
+}
+
+async function assertConfiguredEndpointPermission(settings) {
+  if (settings.backend !== "local") {
+    return;
+  }
+  const baseUrl = normalizeBaseUrl(settings.localBaseUrl);
+  if (!baseUrl) {
+    return;
+  }
+  const originPattern = endpointPermissionOrigin(baseUrl);
+  if (!originPattern) {
+    return;
+  }
+  const hasPermission = await chrome.permissions?.contains?.({
+    origins: [originPattern]
+  });
+  if (!hasPermission) {
+    throw codedError(
+      "请先打开扩展并允许访问此本地 API 地址",
+      "LOCAL_ENDPOINT_PERMISSION_REQUIRED"
+    );
   }
 }
 
@@ -492,21 +517,16 @@ async function checkTranslationBackend(settings) {
 
 // 同时打所有候选端口。串行的话没人监听的端口要各等一次超时,五个端口
 // 最坏要等 7.5s;并行之后整体就是最慢的那一个。
-async function detectLocalBackends(apiKey) {
+async function detectLocalBackends() {
   const results = await Promise.all(
     LOCAL_BACKEND_CANDIDATES.map((candidate) =>
-      probeLocalBackendCandidate(candidate, apiKey)
+      probeLocalBackendCandidate(candidate)
     )
   );
   return results.filter((result) => result !== null);
 }
 
-async function probeLocalBackendCandidate(candidate, apiKey) {
-  const headers = {};
-  if (apiKey?.trim()) {
-    headers.Authorization = `Bearer ${apiKey.trim()}`;
-  }
-
+async function probeLocalBackendCandidate(candidate) {
   const controller = new AbortController();
   const timeoutId = setTimeout(
     () => controller.abort(),
@@ -515,9 +535,17 @@ async function probeLocalBackendCandidate(candidate, apiKey) {
   try {
     const response = await fetch(modelsUrl(candidate.baseUrl), {
       method: "GET",
-      headers,
+      headers: {},
       signal: controller.signal
     });
+    if (response.status === 401) {
+      return {
+        baseUrl: candidate.baseUrl,
+        label: candidate.label,
+        models: [],
+        requiresAuth: true
+      };
+    }
     if (!response.ok) {
       return null;
     }

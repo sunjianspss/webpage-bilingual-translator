@@ -129,7 +129,7 @@ test("a running service with no model loaded is still reported", async () => {
 });
 
 // 本机 :5000 上就蹲着一个返回 403 的东西，它不是 OpenAI 兼容服务。
-test("a non-2xx answer is not reported as a backend", async () => {
+test("an unrelated forbidden answer is not reported as a backend", async () => {
   reset({ 8000: modelsResponse([], 403) });
 
   const response = await detect();
@@ -137,16 +137,25 @@ test("a non-2xx answer is not reported as a backend", async () => {
   assert.deepEqual(response.backends, []);
 });
 
-test("the API token is sent to every probe", async () => {
-  reset({ 1234: modelsResponse(["m"]) });
+test("an unauthorized service is reported without exposing its token", async () => {
+  reset({ 1234: modelsResponse([], 401) });
 
-  await detect("local-secret");
+  const response = await detect("local-secret");
 
   assert.equal(requests.length, LOCAL_BACKEND_CANDIDATES.length);
+  assert.deepEqual(
+    response.backends,
+    [{
+      baseUrl: "http://127.0.0.1:1234/v1",
+      label: "LM Studio",
+      models: [],
+      requiresAuth: true
+    }]
+  );
   for (const request of requests) {
-    assert.equal(
-      request.options.headers.Authorization,
-      "Bearer local-secret"
+    assert.ok(
+      !request.options.headers.Authorization,
+      `credential leaked to ${request.url}`
     );
   }
 });

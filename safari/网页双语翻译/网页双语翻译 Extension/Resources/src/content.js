@@ -59,12 +59,17 @@
   const MUTATION_SCAN_DEBOUNCE_MS = 120;
   const FAILURE_REASON_MAX_LENGTH = 60;
   const PERSISTENT_CACHE_KEY_PREFIX = "aiPageTranslatorCache:";
-  const PERSISTENT_CACHE_INDEX_KEY = "aiPageTranslatorCacheIndex";
+  const PERSISTENT_CACHE_GENERATION_KEY_PREFIX =
+    "aiPageTranslatorCacheGeneration:";
+  const LEGACY_PERSISTENT_CACHE_INDEX_KEY = "aiPageTranslatorCacheIndex";
   const PERSISTENT_CACHE_MAX_ENTRIES = 3000;
+  // 每个不可变代际标记至少保留一小时；标记到期时回收自身，并淘汰该页
+  // 旧签名下的缓存值，既封住休眠标签页的迟到写入，也避免元数据增长。
+  const PERSISTENT_CACHE_GENERATION_RETENTION_MS = 60 * 60 * 1000;
   const TARGET_LANGUAGE_SCRIPT_PATTERNS = {
-    "zh-CN": /[\u3400-\u9fff]/,
-    "zh-TW": /[\u3400-\u9fff]/,
-    ja: /[\u3040-\u30ff\u3400-\u9fff]/,
+    // 汉字本身无法可靠区分简体、繁体和日语。只在看到目标语言独有的
+    // 书写系统时跳过；拿不准就交给翻译服务，避免静默漏译。
+    ja: /[\u3040-\u30ff]/,
     ko: /[\uac00-\ud7af]/
   };
   let taskGeneration = 0;
@@ -164,7 +169,15 @@
       sendJobMessage("RELEASE_TRANSLATION_JOB", session.jobId);
     }
     activeSession = null;
-  }, { once: true });
+    hideStatus();
+    state = {
+      ...state,
+      status: session.usedPlacements > 0 ? "done" : "idle",
+      translated: session.usedPlacements,
+      total: session.usedPlacements,
+      error: ""
+    };
+  });
 
   function startTranslation(settings) {
     const jobId = pendingStartJobId;
@@ -175,7 +188,12 @@
 
     const nextSettings = { ...settings };
     const taskId = ++taskGeneration;
-    clearTranslations(nextSettings.viewMode || state.viewMode);
+    const continuingExistingTranslations = hasCompatibleTranslations(
+      nextSettings.targetLanguage
+    );
+    if (!continuingExistingTranslations) {
+      clearTranslations(nextSettings.viewMode || state.viewMode);
+    }
     ensureStyles();
     setViewMode(nextSettings.viewMode || "bilingual");
 
@@ -211,6 +229,20 @@
     translatePage(session).catch((error) => {
       handleTaskError(session, error);
     });
+  }
+
+  function hasCompatibleTranslations(targetLanguage) {
+    const translations = [
+      ...document.querySelectorAll(`.${TRANSLATION_CLASS}`)
+    ];
+    if (translations.length === 0) {
+      return false;
+    }
+    const normalizedTarget = String(targetLanguage || "").toLowerCase();
+    return translations.every(
+      (translation) =>
+        String(translation.lang || "").toLowerCase() === normalizedTarget
+    );
   }
 
   function handleTaskError(session, error) {
@@ -376,8 +408,7 @@
       : [0];
     let foundCandidates = false;
 
-    let totalFailures = 0;
-    let failureReason = "";
+    let finalFailures = [];
     try {
       for (const delay of rescanDelays) {
         if (delay > 0) {
@@ -386,13 +417,14 @@
         assertCurrentTask(taskId);
         const result = await translateCurrentCandidates(session);
         foundCandidates = foundCandidates || result.discovered > 0;
-        totalFailures += countFailedPlacements(result.failures);
-        failureReason = failureReason || describeFailures(result.failures);
+        finalFailures = result.failures;
       }
     } finally {
       session.initializing = false;
     }
 
+    const totalFailures = countFailedPlacements(finalFailures);
+    const failureReason = describeFailures(finalFailures);
     const hasFailures = totalFailures > 0;
     const reasonSuffix = hasFailures ? failureSuffix(failureReason) : "";
     state = {
@@ -588,6 +620,16 @@
     await hydratePersistentCache(session, [...groupsByKey.values()]);
 
     for (const group of groupsByKey.values()) {
+      const currentPlacements = group.placements.filter(
+        placementIsCurrentAndVisible
+      );
+      if (currentPlacements.length !== group.placements.length) {
+        session.rescanRequested = true;
+        group.placements = currentPlacements;
+      }
+      if (group.placements.length === 0) {
+        continue;
+      }
       if (session.translationCache.has(group.key)) {
         continue;
       }
@@ -604,7 +646,9 @@
         group
       }));
     }
-    return [...groupsByKey.values()];
+    return [...groupsByKey.values()].filter(
+      (group) => group.placements.length > 0
+    );
   }
 
   function applyTranslatedGroup(session, group, translatedText) {
@@ -618,6 +662,11 @@
         const alreadyCounted = session.countedTargets.has(
           identity
         );
+        if (!placementIsCurrentAndVisible(placement)) {
+          session.pendingRetranslationTargets.add(placement.target);
+          session.rescanRequested = true;
+          continue;
+        }
         if (
           !alreadyCounted &&
           session.usedPlacements + newPlacements >=
@@ -646,6 +695,56 @@
     });
     session.usedPlacements += newPlacements;
     group.applied = true;
+  }
+
+  function placementSourceText(placement) {
+    if (placement.targetType === "flow") {
+      return normalizeText(
+        (placement.nodes || [])
+          .filter((node) => node.isConnected)
+          .map((node) => renderedText(node))
+          .join(" ")
+      );
+    }
+    if (placement.targetType === "text") {
+      return normalizeText(placement.target?.textContent);
+    }
+    const value = renderedText(
+      placement.target,
+      Boolean(placement.structured)
+    );
+    return placement.structured
+      ? normalizeStructuredText(value)
+      : normalizeText(value);
+  }
+
+  function placementIsCurrentAndVisible(placement) {
+    if (
+      placement.targetType === "flow" &&
+      !(placement.nodes || []).every((node) => {
+        if (node.parentNode !== placement.target) {
+          return false;
+        }
+        if (node.nodeType === Node.TEXT_NODE) {
+          return textNodeIsVisiblyRendered(node);
+        }
+        if (node.nodeType !== Node.ELEMENT_NODE) {
+          return false;
+        }
+        return node.matches("br")
+          ? hasVisibleAncestry(node)
+          : isVisiblyRendered(node);
+      })
+    ) {
+      return false;
+    }
+    const visibleElement = placement.targetType === "text"
+      ? placement.target?.parentElement
+      : placement.target;
+    return Boolean(
+      isVisiblyRendered(visibleElement) &&
+      placementSourceText(placement) === placement.text
+    );
   }
 
   function placementIdentity(placement) {
@@ -895,8 +994,16 @@
     return `${location.hostname}${location.pathname}`;
   }
 
-  function pageCachePrefix() {
-    return `${PERSISTENT_CACHE_KEY_PREFIX}${hashText(pageCacheScope())}:`;
+  function pageCachePrefix(scope = pageCacheScope()) {
+    return `${PERSISTENT_CACHE_KEY_PREFIX}${hashText(scope)}:`;
+  }
+
+  function pageCacheGenerationPrefix(scope = pageCacheScope()) {
+    return `${PERSISTENT_CACHE_GENERATION_KEY_PREFIX}${hashText(scope)}:`;
+  }
+
+  function pageCacheGenerationKey(scope, generation) {
+    return `${pageCacheGenerationPrefix(scope)}${generation}`;
   }
 
   function clearPagePersistentCache() {
@@ -905,34 +1012,71 @@
     if (!storage) {
       return Promise.resolve();
     }
-    const prefix = pageCachePrefix();
+    const scope = pageCacheScope();
+    const prefix = pageCachePrefix(scope);
+    const nextGeneration = createCacheGeneration();
+    const generationKey = pageCacheGenerationKey(scope, nextGeneration);
     const cleared = persistentCacheWriteChain.then(() =>
-      removePagePersistentEntries(storage, prefix)
+      removePagePersistentEntries(
+        storage,
+        prefix,
+        generationKey
+      )
     );
     persistentCacheWriteChain = cleared.catch(() => {});
     return cleared;
   }
 
-  async function removePagePersistentEntries(storage, prefix) {
-    const indexResult = await storage.get(PERSISTENT_CACHE_INDEX_KEY);
-    const index = Array.isArray(indexResult?.[PERSISTENT_CACHE_INDEX_KEY])
-      ? indexResult[PERSISTENT_CACHE_INDEX_KEY]
-      : [];
-    const pageKeys = index.filter((key) => key.startsWith(prefix));
-    if (pageKeys.length === 0) {
-      return;
-    }
+  async function removePagePersistentEntries(
+    storage,
+    prefix,
+    generationKey
+  ) {
+    // 先换代，再删值。其他标签页稍后完成的旧请求会带旧 generation，
+    // 即使它在本次 remove 之后才落盘，也会在自己的写后校验中被删除。
     await storage.set({
-      [PERSISTENT_CACHE_INDEX_KEY]: index.filter(
-        (key) => !key.startsWith(prefix)
-      )
+      [generationKey]: {
+        updatedAt: Date.now()
+      }
     });
-    await storage.remove(pageKeys);
+    const stored = await storage.get(null);
+    const pageKeys = Object.keys(stored || {}).filter((key) =>
+      key.startsWith(prefix)
+    );
+    const keysToRemove = [
+      ...pageKeys,
+      LEGACY_PERSISTENT_CACHE_INDEX_KEY
+    ];
+    await storage.remove(keysToRemove);
+    await prunePersistentCache(storage);
   }
 
-  function persistentCacheKey(targetLanguage, groupKey) {
-    return `${pageCachePrefix()}${hashText(
-      `${pageCacheScope()}\u0000${targetLanguage}\u0000${groupKey}`
+  function createCacheGeneration() {
+    return globalThis.crypto?.randomUUID?.() ||
+      `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  }
+
+  function cacheGenerationSignature(stored, generationPrefix) {
+    const markerKeys = Object.keys(stored || {})
+      .filter((key) => key.startsWith(generationPrefix))
+      .sort();
+    return markerKeys.length > 0 ? markerKeys.join("\u0000") : "0";
+  }
+
+  function persistentCacheKey(
+    scope,
+    targetLanguage,
+    groupKey,
+    generation
+  ) {
+    return `${pageCachePrefix(scope)}${hashText(
+      `${scope}\u0000${targetLanguage}\u0000${generation}\u0000${groupKey}`
+    )}`;
+  }
+
+  function legacyPersistentCacheKey(scope, targetLanguage, groupKey) {
+    return `${pageCachePrefix(scope)}${hashText(
+      `${scope}\u0000${targetLanguage}\u0000${groupKey}`
     )}`;
   }
 
@@ -941,26 +1085,54 @@
     if (!storage) {
       return;
     }
+    const scope = pageCacheScope();
+    const generationPrefix = pageCacheGenerationPrefix(scope);
+    // 有效期从读操作发起前算，不能在 await 返回后才起算：标签页可能在
+    // Promise continuation 运行前休眠，而别的标签页已经完成了 clear。
+    const capturedAt = Date.now();
+    let stored;
+    try {
+      stored = await storage.get(null);
+    } catch (_error) {
+      return;
+    }
+    const generation = cacheGenerationSignature(stored, generationPrefix);
+    session.cacheGenerationCapturedAt = capturedAt;
+    session.cacheScope = scope;
+    session.cacheGeneration = generation;
+    session.cacheGenerationPrefix = generationPrefix;
     const targetLanguage = session.settings.targetLanguage;
     const lookup = new Map();
     for (const group of groups) {
       if (session.translationCache.has(group.key)) {
         continue;
       }
-      lookup.set(persistentCacheKey(targetLanguage, group.key), group.key);
+      lookup.set(
+        persistentCacheKey(
+          scope,
+          targetLanguage,
+          group.key,
+          generation
+        ),
+        group.key
+      );
+      if (generation === "0") {
+        lookup.set(
+          legacyPersistentCacheKey(scope, targetLanguage, group.key),
+          group.key
+        );
+      }
     }
     if (lookup.size === 0) {
       return;
     }
 
-    let stored;
-    try {
-      stored = await storage.get([...lookup.keys()]);
-    } catch (_error) {
-      return;
-    }
     for (const [storageKey, groupKey] of lookup) {
-      const text = stored?.[storageKey];
+      if (session.translationCache.has(groupKey)) {
+        continue;
+      }
+      const value = stored?.[storageKey];
+      const text = typeof value === "string" ? value : value?.text;
       if (typeof text === "string" && text) {
         session.translationCache.set(groupKey, text);
       }
@@ -969,17 +1141,34 @@
 
   function queuePersistentCacheWrite(session, groupKey, translatedText) {
     const storage = chrome?.storage?.local;
-    if (!storage) {
+    if (
+      !storage ||
+      !Number.isFinite(session.cacheGenerationCapturedAt)
+    ) {
       return;
     }
+    const scope = session.cacheScope || pageCacheScope();
+    const generation = typeof session.cacheGeneration === "string"
+      ? session.cacheGeneration
+      : "0";
     const storageKey = persistentCacheKey(
+      scope,
       session.settings.targetLanguage,
-      groupKey
+      groupKey,
+      generation
     );
-    // 整页翻译会产生上百次写入，逐条写会把整个索引数组（最多 3000 项）
-    // 反复读出再写回。这里先攒进待写队列：一次落盘进行中时新到的条目
-    // 会自动合并到下一次 flush，写入次数从“每条一次”降到“每轮一次”。
-    persistentCachePendingWrites.set(storageKey, translatedText);
+    // 整页翻译会产生上百个缓存值。这里先攒进待写队列：
+    // 一次落盘进行中时新到的条目会自动合并到下一次 flush，
+    // 避免每个段落都单独触发一次 storage 写入和全局上限检查。
+    persistentCachePendingWrites.set(storageKey, {
+      text: translatedText,
+      generation,
+      generationPrefix:
+        session.cacheGenerationPrefix || pageCacheGenerationPrefix(scope),
+      expiresAt:
+        session.cacheGenerationCapturedAt +
+        PERSISTENT_CACHE_GENERATION_RETENTION_MS
+    });
     persistentCacheWriteChain = persistentCacheWriteChain
       .then(() => flushPersistentCacheWrites(storage))
       .catch(() => {});
@@ -992,28 +1181,107 @@
     const entries = [...persistentCachePendingWrites];
     persistentCachePendingWrites.clear();
 
-    const indexResult = await storage.get(PERSISTENT_CACHE_INDEX_KEY);
-    const index = Array.isArray(indexResult?.[PERSISTENT_CACHE_INDEX_KEY])
-      ? indexResult[PERSISTENT_CACHE_INDEX_KEY]
-      : [];
-    const writtenKeys = new Set(entries.map(([key]) => key));
-    const nextIndex = index.filter((key) => !writtenKeys.has(key));
-    for (const [key] of entries) {
-      nextIndex.push(key);
+    const writtenAt = Date.now();
+    await storage.set(Object.fromEntries(
+      entries.map(([key, value], index) => [
+        key,
+        {
+          text: value.text,
+          generation: hashText(value.generation),
+          updatedAt: writtenAt + index / Math.max(entries.length, 1)
+        }
+      ])
+    ));
+    await storage.remove(LEGACY_PERSISTENT_CACHE_INDEX_KEY);
+    await removeWritesFromStaleGenerations(storage, entries);
+    await prunePersistentCache(storage);
+  }
+
+  async function removeWritesFromStaleGenerations(storage, entries) {
+    const storedGenerations = await storage.get(null);
+    const now = Date.now();
+    const staleKeys = entries
+      .filter(([, value]) =>
+        cacheGenerationSignature(
+          storedGenerations,
+          value.generationPrefix
+        ) !== value.generation ||
+        now >= value.expiresAt
+      )
+      .map(([key]) => key);
+    if (staleKeys.length > 0) {
+      await storage.remove(staleKeys);
+    }
+  }
+
+  async function prunePersistentCache(storage) {
+    const stored = await storage.get(null);
+    const cacheEntries = Object.entries(stored || {})
+      .filter(([key]) => key.startsWith(PERSISTENT_CACHE_KEY_PREFIX));
+    const keysToRemove = new Set();
+    if (cacheEntries.length > PERSISTENT_CACHE_MAX_ENTRIES) {
+      cacheEntries.sort(([leftKey, leftValue], [rightKey, rightValue]) => {
+        const leftUpdatedAt = cacheEntryUpdatedAt(leftValue);
+        const rightUpdatedAt = cacheEntryUpdatedAt(rightValue);
+        return leftUpdatedAt - rightUpdatedAt ||
+          leftKey.localeCompare(rightKey);
+      });
+      const excess = cacheEntries.length - PERSISTENT_CACHE_MAX_ENTRIES;
+      for (const [key] of cacheEntries.slice(0, excess)) {
+        keysToRemove.add(key);
+      }
     }
 
-    const evicted = [];
-    while (nextIndex.length > PERSISTENT_CACHE_MAX_ENTRIES) {
-      evicted.push(nextIndex.shift());
+    const generationEntries = Object.entries(stored || {}).filter(
+      ([key]) => key.startsWith(PERSISTENT_CACHE_GENERATION_KEY_PREFIX)
+    );
+    const expirationThreshold =
+      Date.now() - PERSISTENT_CACHE_GENERATION_RETENTION_MS;
+    const invalidatedPageHashes = new Set();
+    for (const [generationKey, value] of generationEntries) {
+      const markerSuffix = generationKey.slice(
+        PERSISTENT_CACHE_GENERATION_KEY_PREFIX.length
+      );
+      const separatorIndex = markerSuffix.indexOf(":");
+      if (
+        separatorIndex > 0 &&
+        cacheGenerationUpdatedAt(value) <= expirationThreshold
+      ) {
+        keysToRemove.add(generationKey);
+        invalidatedPageHashes.add(markerSuffix.slice(0, separatorIndex));
+      }
     }
 
-    await storage.set({
-      ...Object.fromEntries(entries),
-      [PERSISTENT_CACHE_INDEX_KEY]: nextIndex
-    });
-    if (evicted.length > 0) {
-      await storage.remove(evicted);
+    // 代际签名由该页仍存活的不可变 marker 集合组成。回收任一 marker
+    // 都会改变签名，所以同时删掉该页旧签名下的值，避免留下不可达数据。
+    for (const pageHash of invalidatedPageHashes) {
+      const pagePrefix = `${PERSISTENT_CACHE_KEY_PREFIX}${pageHash}:`;
+      for (const [key] of cacheEntries) {
+        if (key.startsWith(pagePrefix)) {
+          keysToRemove.add(key);
+        }
+      }
     }
+
+    if (keysToRemove.size > 0) {
+      await storage.remove([...keysToRemove]);
+    }
+  }
+
+  function cacheEntryUpdatedAt(value) {
+    const updatedAt = typeof value === "object" && value
+      ? Number(value.updatedAt)
+      : 0;
+    return Number.isFinite(updatedAt) ? updatedAt : 0;
+  }
+
+  function cacheGenerationUpdatedAt(value) {
+    // 老版本的纯字符串标记没有可证明的创建时间，保守保留；新版本对象
+    // 才参加 TTL 回收，避免升级瞬间误接纳仍在飞行中的 generation=0 写入。
+    if (typeof value === "string") {
+      return Number.POSITIVE_INFINITY;
+    }
+    return cacheEntryUpdatedAt(value);
   }
 
   function scriptCharRatio(text, pattern) {
@@ -1155,8 +1423,8 @@
 
       const structured = structuredTextElements.has(element);
       const text = structured
-        ? normalizeStructuredText(element.innerText || element.textContent)
-        : normalizeText(element.innerText || element.textContent);
+        ? normalizeStructuredText(renderedText(element, true))
+        : normalizeText(renderedText(element));
       const maxLength = structured
         ? STRUCTURED_TEXT_MAX_LENGTH
         : DEFAULT_TEXT_MAX_LENGTH;
@@ -1306,7 +1574,7 @@
         return false;
       }
       const text = normalizeStructuredText(
-        element.innerText || element.textContent
+        renderedText(element, true)
       );
       return (
         text.length >= 20 &&
@@ -1438,6 +1706,9 @@
       if (container.closest(EXCLUDED_CONTAINER_SELECTOR)) {
         continue;
       }
+      if (!isVisiblyRendered(container)) {
+        continue;
+      }
       // flush() 只在 run 里含链接、且至少两个节点时才产出候选。这两个
       // 条件都不成立的容器，下面对每个子节点的 getComputedStyle 是白做的。
       if (
@@ -1451,7 +1722,7 @@
       let consecutiveBreaks = 0;
       const flush = () => {
         const text = normalizeText(
-          run.map((node) => node.textContent || "").join(" ")
+          run.map((node) => renderedText(node)).join(" ")
         );
         const hasLink = run.some(
           (node) =>
@@ -1488,12 +1759,19 @@
         }
 
         if (node.matches("br")) {
+          if (!hasVisibleAncestry(node)) {
+            continue;
+          }
           consecutiveBreaks += 1;
           if (consecutiveBreaks >= 2) {
             flush();
           } else if (run.length > 0) {
             run.push(node);
           }
+          continue;
+        }
+
+        if (!isVisiblyRendered(node)) {
           continue;
         }
 
@@ -1626,16 +1904,177 @@
       return false;
     }
 
-    const style = window.getComputedStyle(element);
-    if (
-      style.display === "none" ||
-      style.visibility === "hidden" ||
-      Number(style.opacity) === 0
-    ) {
+    return isVisiblyRendered(element);
+  }
+
+  function isVisiblyRendered(element) {
+    if (!hasVisibleAncestry(element)) {
       return false;
     }
-    const rect = element.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
+    let layoutElement = element;
+    while (
+      layoutElement &&
+      window.getComputedStyle(layoutElement).display === "contents"
+    ) {
+      layoutElement = layoutElement.parentElement;
+    }
+    if (!layoutElement) {
+      return false;
+    }
+    const rect = layoutElement.getBoundingClientRect();
+    return (
+      rect.width > 0 &&
+      rect.height > 0 &&
+      !isFullyClippedByOverflowAncestor(element, rect)
+    );
+  }
+
+  function isFullyClippedByOverflowAncestor(element, targetRect) {
+    for (
+      let ancestor = element?.parentElement;
+      ancestor;
+      ancestor = ancestor.parentElement
+    ) {
+      const style = window.getComputedStyle(ancestor);
+      if (style.display === "contents") {
+        continue;
+      }
+      const clipsHorizontally = overflowClips(
+        overflowAxisValue(style, "overflowX", 0)
+      );
+      const clipsVertically = overflowClips(
+        overflowAxisValue(style, "overflowY", 1)
+      );
+      if (!clipsHorizontally && !clipsVertically) {
+        continue;
+      }
+      const ancestorRect = ancestor.getBoundingClientRect();
+      if (
+        (clipsHorizontally &&
+          rectIntersectionLength(
+            targetRect,
+            ancestorRect,
+            "left",
+            "right",
+            "width"
+          ) <= 0) ||
+        (clipsVertically &&
+          rectIntersectionLength(
+            targetRect,
+            ancestorRect,
+            "top",
+            "bottom",
+            "height"
+          ) <= 0)
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function overflowAxisValue(style, property, shorthandIndex) {
+    const shorthandParts = String(style.overflow || "")
+      .toLowerCase()
+      .trim()
+      .split(/\s+/)
+      .filter(Boolean);
+    const shorthandValue = shorthandParts[shorthandIndex] ||
+      shorthandParts[0] || "";
+    const axisValue = String(style[property] || "").toLowerCase();
+    // JSDOM（以及少数旧 WebKit 构建）会把 overflow:hidden 的 shorthand
+    // 保留下来，却把两个 computed axis 错报为 visible；这时以明确的
+    // shorthand 为准。正常浏览器里轴值和 shorthand 一致。
+    if (
+      shorthandParts.length === 1 &&
+      axisValue === "visible" &&
+      shorthandValue !== "visible"
+    ) {
+      return shorthandValue;
+    }
+    return axisValue || shorthandValue;
+  }
+
+  function overflowClips(value) {
+    return String(value || "")
+      .toLowerCase()
+      .split(/\s+/)
+      .some((part) =>
+        part === "hidden" ||
+        part === "clip"
+      );
+  }
+
+  function rectIntersectionLength(
+    targetRect,
+    ancestorRect,
+    startProperty,
+    endProperty,
+    sizeProperty
+  ) {
+    const targetStart = Number.isFinite(Number(targetRect[startProperty]))
+      ? Number(targetRect[startProperty])
+      : 0;
+    const ancestorStart = Number.isFinite(Number(ancestorRect[startProperty]))
+      ? Number(ancestorRect[startProperty])
+      : 0;
+    const targetEnd = Number.isFinite(Number(targetRect[endProperty]))
+      ? Number(targetRect[endProperty])
+      : targetStart + Number(targetRect[sizeProperty] || 0);
+    const ancestorEnd = Number.isFinite(Number(ancestorRect[endProperty]))
+      ? Number(ancestorRect[endProperty])
+      : ancestorStart + Number(ancestorRect[sizeProperty] || 0);
+    return Math.min(targetEnd, ancestorEnd) -
+      Math.max(targetStart, ancestorStart);
+  }
+
+  function hasVisibleAncestry(element) {
+    if (!element?.isConnected) {
+      return false;
+    }
+    for (let current = element; current; current = current.parentElement) {
+      if (
+        current.hasAttribute("hidden") ||
+        current.getAttribute("aria-hidden") === "true"
+      ) {
+        return false;
+      }
+      const style = window.getComputedStyle(current);
+      if (
+        style.display === "none" ||
+        style.visibility === "hidden" ||
+        style.visibility === "collapse" ||
+        Number.parseFloat(style.opacity) === 0 ||
+        style.contentVisibility === "hidden" ||
+        styleFullyClipsContent(style) ||
+        filterMakesContentTransparent(style.filter)
+      ) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  function styleFullyClipsContent(style) {
+    const clip = String(style.clip || "")
+      .toLowerCase()
+      .replace(/\s+/g, "");
+    const clipPath = String(
+      style.clipPath || style.webkitClipPath || ""
+    )
+      .toLowerCase()
+      .replace(/\s+/g, "");
+    return (
+      clip === "rect(0px,0px,0px,0px)" ||
+      clip === "rect(0,0,0,0)" ||
+      /^inset\((?:50|100)%\)$/.test(clipPath)
+    );
+  }
+
+  function filterMakesContentTransparent(value) {
+    return /(?:^|\s)opacity\((?:0|0%)\)(?:\s|$)/i.test(
+      String(value || "")
+    );
   }
 
   function collectDirectTextNodes(root) {
@@ -1652,12 +2091,7 @@
         continue;
       }
 
-      const style = window.getComputedStyle(element);
-      if (
-        style.display === "none" ||
-        style.visibility === "hidden" ||
-        Number(style.opacity) === 0
-      ) {
+      if (!isVisiblyRendered(element)) {
         continue;
       }
 
@@ -1678,6 +2112,72 @@
 
   function normalizeText(value) {
     return String(value || "").replace(/\s+/g, " ").trim();
+  }
+
+  function renderedText(node, preserveLayout = false) {
+    if (node?.nodeType === Node.ELEMENT_NODE) {
+      if (!isVisiblyRendered(node)) {
+        return "";
+      }
+      return visibleTextContent(node, preserveLayout);
+    }
+    return node?.textContent || "";
+  }
+
+  function visibleTextContent(element, preserveLayout) {
+    if (preserveLayout) {
+      const chunks = [];
+      appendVisibleText(element, element, chunks);
+      return chunks.join("");
+    }
+    const text = [];
+    const walker = document.createTreeWalker(
+      element,
+      window.NodeFilter.SHOW_TEXT
+    );
+    while (walker.nextNode()) {
+      const node = walker.currentNode;
+      if (textNodeIsVisiblyRendered(node)) {
+        text.push(node.textContent || "");
+      }
+    }
+    return text.join(" ");
+  }
+
+  function appendVisibleText(node, root, chunks) {
+    if (node.nodeType === Node.TEXT_NODE) {
+      if (textNodeIsVisiblyRendered(node)) {
+        chunks.push(node.textContent || "");
+      }
+      return;
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) {
+      return;
+    }
+    if (node.matches("br")) {
+      if (hasVisibleAncestry(node)) {
+        chunks.push("\n");
+      }
+      return;
+    }
+    if (node !== root && !isVisiblyRendered(node)) {
+      return;
+    }
+    const separatesLines =
+      node !== root && BLOCK_LEVEL_TAGS.has(node.tagName);
+    if (separatesLines) {
+      chunks.push("\n");
+    }
+    for (const child of node.childNodes) {
+      appendVisibleText(child, root, chunks);
+    }
+    if (separatesLines) {
+      chunks.push("\n");
+    }
+  }
+
+  function textNodeIsVisiblyRendered(node) {
+    return isVisiblyRendered(node?.parentElement);
   }
 
   function normalizeStructuredText(value) {
@@ -1985,6 +2485,11 @@
     const element = node?.nodeType === Node.ELEMENT_NODE
       ? node
       : node?.parentElement;
+    if (
+      element?.closest?.(`.${ORIGINAL_CLASS}`)?.closest?.(`[${MARKER}]`)
+    ) {
+      return false;
+    }
     return Boolean(
       element &&
       (
@@ -2007,7 +2512,8 @@
         source &&
         (
           source.dataset.translatorTarget === "element" ||
-          source.dataset.translatorTarget === "heading"
+          source.dataset.translatorTarget === "heading" ||
+          source.dataset.translatorTarget === "flow"
         )
       ) {
         sources.add(source);
@@ -2019,6 +2525,20 @@
 
     withObserverPaused(session, () => {
       for (const source of sources) {
+        if (source.dataset.translatorTarget === "flow") {
+          const container = source.parentNode;
+          const original = source.querySelector(
+            `:scope > .${ORIGINAL_CLASS}`
+          );
+          if (container && original) {
+            while (original.firstChild) {
+              container.insertBefore(original.firstChild, source);
+            }
+            source.remove();
+            session.pendingRetranslationTargets.add(container);
+          }
+          continue;
+        }
         if (source.dataset.translatorTarget === "heading") {
           const translation = source.nextElementSibling;
           if (translation?.dataset.translatorForHeading === "true") {

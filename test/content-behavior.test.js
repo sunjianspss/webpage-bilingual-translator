@@ -56,7 +56,9 @@ function createHarness({
   url = "https://example.com/article",
   translate = successfulTranslation,
   storageStore = {},
-  storageLocal
+  storageLocal,
+  rectForElement,
+  timerScale = 1
 }) {
   const dom = new JSDOM(html, {
     url,
@@ -66,6 +68,11 @@ function createHarness({
   const { window } = dom;
   const listeners = [];
   const runtimeMessages = [];
+  if (timerScale !== 1) {
+    const nativeSetTimeout = window.setTimeout.bind(window);
+    window.setTimeout = (callback, delay, ...args) =>
+      nativeSetTimeout(callback, delay * timerScale, ...args);
+  }
 
   Object.defineProperty(
     window.HTMLElement.prototype,
@@ -73,6 +80,9 @@ function createHarness({
     {
       configurable: true,
       value() {
+        if (rectForElement) {
+          return rectForElement(this);
+        }
         return {
           x: 0,
           y: 0,
@@ -393,6 +403,68 @@ test("enforces maxSegments as one placement budget across dynamic rescans", asyn
   assert.equal(harness.requestedSegments().length, 2);
 });
 
+test("clicking translate again keeps the first pageful and continues the tail", async (t) => {
+  const paragraphs = Array.from(
+    { length: 222 },
+    (_value, index) =>
+      `Paragraph ${index + 1} contains unique visible text for continuation coverage.`
+  );
+  const harness = createHarness({
+    html: `<main>${paragraphs
+      .map((text, index) => `<p id="continue-${index}">${text}</p>`)
+      .join("")}</main>`
+  });
+  t.after(harness.close);
+
+  harness.start({ maxSegments: 220 });
+  const firstState = await waitForTerminalState(harness, 3000);
+  assert.equal(firstState.status, "done", firstState.error);
+  assert.equal(harness.requestedSegments().length, 220);
+  const preservedTranslations = paragraphs.slice(0, 220).map((_text, index) =>
+    harness.document
+      .querySelector(`#continue-${index}`)
+      .querySelector(TRANSLATION_SELECTOR)
+  );
+  assert.ok(preservedTranslations.every(Boolean));
+
+  harness.start({ maxSegments: 220 });
+  const secondState = await waitForTerminalState(harness, 3000);
+  assert.equal(secondState.status, "done", secondState.error);
+  assert.equal(
+    harness.requestedSegments().length,
+    222,
+    "the second click should send only the untranslated tail"
+  );
+  assert.equal(
+    harness.document.querySelectorAll(TRANSLATION_SELECTOR).length,
+    222
+  );
+  for (const translation of preservedTranslations) {
+    assert.equal(translation.isConnected, true, "existing translations stay mounted");
+  }
+});
+
+test("changing the target language replaces incompatible existing translations", async (t) => {
+  const source = "Changing the requested language must replace the old translation.";
+  const harness = createHarness({ html: `<main><p>${source}</p></main>` });
+  t.after(harness.close);
+
+  harness.start({ targetLanguage: "zh-CN" });
+  await waitForTerminalState(harness);
+  harness.start({ targetLanguage: "ja" });
+  await waitForTerminalState(harness);
+
+  assert.deepEqual(
+    harness.requestedSegments().map(({ text }) => text),
+    [source, source]
+  );
+  const translations = [
+    ...harness.document.querySelectorAll(TRANSLATION_SELECTOR)
+  ];
+  assert.equal(translations.length, 1);
+  assert.equal(translations[0].lang, "ja");
+});
+
 test("observes and translates paragraphs added by a non-X SPA", async (t) => {
   const dynamicText = "This paragraph arrived after client-side navigation completed.";
   const harness = createHarness({
@@ -497,6 +569,57 @@ test("retranslates an existing source node when a SPA changes its text", async (
   );
 });
 
+test("never applies an in-flight response after its source text changes", async (t) => {
+  const initialText = "The paragraph starts with source text sent to a slow model.";
+  const updatedText = "The paragraph changed while the slow model was responding.";
+  let releaseFirstResponse;
+  const harness = createHarness({
+    html: `<main><p id="mutable">${initialText}</p></main>`,
+    translate(message) {
+      if (!releaseFirstResponse) {
+        return new Promise((resolve) => {
+          releaseFirstResponse = () => resolve({
+            ok: true,
+            translations: Object.fromEntries(
+              message.segments.map((segment) => [
+                segment.id,
+                `【译文:${segment.text}】`
+              ])
+            )
+          });
+        });
+      }
+      return {
+        ok: true,
+        translations: Object.fromEntries(
+          message.segments.map((segment) => [
+            segment.id,
+            `【译文:${segment.text}】`
+          ])
+        )
+      };
+    }
+  });
+  t.after(harness.close);
+
+  harness.start();
+  await waitFor(() => releaseFirstResponse, "the first request to start");
+  const paragraph = harness.document.querySelector("#mutable");
+  paragraph.firstChild.nodeValue = updatedText;
+  releaseFirstResponse();
+
+  await waitFor(
+    () => paragraph.textContent.includes(`【译文:${updatedText}】`),
+    "the updated text to replace the stale in-flight result",
+    1400
+  );
+  assert.doesNotMatch(paragraph.textContent, new RegExp(`【译文:${initialText}】`));
+  assert.deepEqual(
+    harness.requestedSegments().map(({ text }) => text),
+    [initialText, updatedText]
+  );
+});
+
 test("RESTORE_PAGE cancels backend work and restores partially translated DOM", async (t) => {
   const originals = Array.from(
     { length: 8 },
@@ -586,10 +709,7 @@ test("RESTORE_PAGE cannot be undone by a late persistent-cache read", async (t) 
     storageLocal: {
       ...baseStorage,
       async get(keys) {
-        if (
-          Array.isArray(keys) &&
-          keys.some((key) => key.startsWith("aiPageTranslatorCache:"))
-        ) {
+        if (keys === null || keys === undefined) {
           cacheReadStarted();
           await cacheReadGate;
         }
@@ -611,6 +731,58 @@ test("RESTORE_PAGE cannot be undone by a late persistent-cache read", async (t) 
     second.document.querySelectorAll(TRANSLATION_SELECTOR).length,
     0,
     "a cache result arriving after cancellation must not mutate the DOM"
+  );
+});
+
+test("BFCache pagehide ends in-flight state and still cleans up later sessions", async (t) => {
+  let releaseFirstResponse;
+  let requestCount = 0;
+  const harness = createHarness({
+    html: `<main><p>A page may enter the back-forward cache during translation.</p></main>`,
+    translate(message) {
+      requestCount += 1;
+      if (requestCount === 1) {
+        return new Promise((resolve) => {
+          releaseFirstResponse = () => resolve(successfulTranslation(message));
+        });
+      }
+      return successfulTranslation(message);
+    }
+  });
+  t.after(harness.close);
+
+  harness.start();
+  await waitFor(() => releaseFirstResponse, "the first request to start");
+  harness.window.dispatchEvent(
+    new harness.window.PageTransitionEvent("pagehide", { persisted: true })
+  );
+  assert.notEqual(harness.state().status, "translating");
+  releaseFirstResponse();
+  harness.window.dispatchEvent(
+    new harness.window.PageTransitionEvent("pageshow", { persisted: true })
+  );
+
+  const restarted = harness.dispatch({
+    type: "TRANSLATE_PAGE",
+    jobId: "job-after-bfcache",
+    settings: {
+      backend: "deepseek",
+      targetLanguage: "zh-CN",
+      viewMode: "bilingual",
+      maxSegments: 220
+    }
+  });
+  assert.equal(restarted.ok, true, restarted.error);
+  await waitForTerminalState(harness);
+
+  harness.window.dispatchEvent(
+    new harness.window.PageTransitionEvent("pagehide", { persisted: true })
+  );
+  assert.deepEqual(
+    harness.runtimeMessages
+      .filter((message) => message.type === "RELEASE_TRANSLATION_JOB")
+      .map((message) => message.jobId),
+    ["job-content-behavior", "job-after-bfcache"]
   );
 });
 
@@ -636,6 +808,377 @@ test("translates existing content when a SPA reveals it by attribute", async (t)
   );
   assert.ok(
     harness.requestedSegments().some((segment) => segment.text === text)
+  );
+});
+
+test("never sends text hidden by an ancestor or a zero layout box", async (t) => {
+  const visibleText = "This visible paragraph should still be translated normally.";
+  const hiddenDirectText =
+    "This hidden account recovery phrase must never leave the page.";
+  const hiddenFlowText =
+    "This hidden linked paragraph has a reference and must stay private.";
+  const transparentText =
+    "This transparent recovery phrase must never leave the page.";
+  const nestedTransparentText = "NESTED-TRANSPARENT-RECOVERY-CODE";
+  const displayContentsText = "HIDDEN-DISPLAY-CONTENTS-CODE";
+  const clippedText = "VISUALLY-CLIPPED-RECOVERY-CODE";
+  const visibleNestedText =
+    "Visible recovery guidance remains public.";
+  const harness = createHarness({
+    html: `
+      <main>
+        <section hidden>
+          <div>${hiddenDirectText}</div>
+          <div>
+            This hidden linked paragraph has
+            <a href="#private">a reference</a>
+            and must stay private.
+          </div>
+        </section>
+        <div style="width:0;height:0;overflow:hidden">
+          Another zero-geometry direct text must not be translated.
+        </div>
+        <section style="opacity:0">
+          <p>${transparentText}</p>
+        </section>
+        <p id="visible-with-transparent-child">
+          Visible recovery guidance
+          <span style="opacity:0">${nestedTransparentText}</span>
+          <span style="display:contents;visibility:hidden">${displayContentsText}</span>
+          remains public.
+        </p>
+        <p style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0);clip-path:inset(50%)">
+          ${clippedText}
+        </p>
+        <p id="visible">${visibleText}</p>
+      </main>
+    `,
+    rectForElement(element) {
+      const hidden = element.closest("[hidden]");
+      const zeroGeometry = element.closest("[style*='width:0']");
+      const width = hidden || zeroGeometry ? 0 : 640;
+      const height = hidden || zeroGeometry ? 0 : 24;
+      return { width, height };
+    }
+  });
+  t.after(harness.close);
+  Object.defineProperty(
+    harness.document.querySelector("#visible-with-transparent-child"),
+    "innerText",
+    {
+      configurable: true,
+      value:
+        `Visible recovery guidance ${nestedTransparentText} ${displayContentsText} remains public.`
+    }
+  );
+
+  harness.start();
+  const state = await waitForTerminalState(harness);
+  assert.equal(state.status, "done", state.error);
+  assert.deepEqual(
+    harness.requestedSegments().map(({ text }) => text),
+    [visibleNestedText, visibleText]
+  );
+  assert.doesNotMatch(
+    harness.requestedSegments().map(({ text }) => text).join("\n"),
+    new RegExp(
+      `${hiddenDirectText}|${hiddenFlowText}|${transparentText}|` +
+        `${nestedTransparentText}|${displayContentsText}|${clippedText}`
+    )
+  );
+});
+
+test("never sends text fully clipped by a zero-size overflow ancestor", async (t) => {
+  const clippedDirectText = "PRIVATE-DIRECT-TEXT-BEHIND-ZERO-HEIGHT-CLIP";
+  const clippedStructuredText =
+    "PRIVATE STRUCTURED TEXT BEHIND A ZERO HEIGHT OVERFLOW CLIP";
+  const visibleText = "This visible paragraph remains eligible for translation.";
+  const harness = createHarness({
+    html: `
+      <main>
+        <section id="direct-clip" style="height:0;overflow:hidden">
+          <p>${clippedDirectText}</p>
+        </section>
+        <section id="structured-clip" style="height:0;overflow:clip">
+          <div data-testid="tweetText">${clippedStructuredText}</div>
+        </section>
+        <p>${visibleText}</p>
+      </main>
+    `,
+    rectForElement(element) {
+      if (element.matches("#direct-clip, #structured-clip")) {
+        return {
+          top: 0,
+          left: 0,
+          right: 640,
+          bottom: 0,
+          width: 640,
+          height: 0
+        };
+      }
+      return {
+        top: 0,
+        left: 0,
+        right: 640,
+        bottom: 24,
+        width: 640,
+        height: 24
+      };
+    }
+  });
+  t.after(harness.close);
+
+  harness.start();
+  const state = await waitForTerminalState(harness);
+  assert.equal(state.status, "done", state.error);
+  assert.deepEqual(
+    harness.requestedSegments().map(({ text }) => text),
+    [visibleText]
+  );
+});
+
+test("keeps offscreen text inside a user-scrollable overflow container", async (t) => {
+  const scrollableText =
+    "This article paragraph is below the scrollport but remains user accessible.";
+  const harness = createHarness({
+    html: `
+      <main>
+        <section id="scrollport" style="height:100px;overflow:auto">
+          <p id="below-scrollport">${scrollableText}</p>
+        </section>
+      </main>
+    `,
+    rectForElement(element) {
+      if (element.id === "scrollport") {
+        return {
+          top: 0,
+          left: 0,
+          right: 640,
+          bottom: 100,
+          width: 640,
+          height: 100
+        };
+      }
+      if (element.id === "below-scrollport") {
+        return {
+          top: 200,
+          left: 0,
+          right: 640,
+          bottom: 224,
+          width: 640,
+          height: 24
+        };
+      }
+      return {
+        top: 0,
+        left: 0,
+        right: 640,
+        bottom: 240,
+        width: 640,
+        height: 240
+      };
+    }
+  });
+  t.after(harness.close);
+
+  harness.start();
+  const state = await waitForTerminalState(harness);
+  assert.equal(state.status, "done", state.error);
+  assert.deepEqual(
+    harness.requestedSegments().map(({ text }) => text),
+    [scrollableText]
+  );
+});
+
+test("visible flow text excludes hidden inline descendants", async (t) => {
+  const privateText = "PRIVATE-INLINE-RECOVERY-CODE";
+  const transparentPrivateText = "TRANSPARENT-INLINE-RECOVERY-CODE";
+  const contentsPrivateText = "DISPLAY-CONTENTS-INLINE-RECOVERY-CODE";
+  const expected =
+    "Visible introduction public reference and public conclusion.";
+  const harness = createHarness({
+    html: `
+      <main>
+        <div>
+          <span id="lead">Visible introduction <span style="opacity:0">${transparentPrivateText}</span></span>
+          <span style="display:contents;visibility:hidden">${contentsPrivateText}</span>
+          <span hidden style="display:inline">${privateText}</span>
+          <a href="#public">public reference</a>
+          <span>and public conclusion.</span>
+        </div>
+      </main>
+    `
+  });
+  t.after(harness.close);
+  Object.defineProperty(harness.document.querySelector("#lead"), "innerText", {
+    configurable: true,
+    value: `Visible introduction ${transparentPrivateText}`
+  });
+
+  harness.start();
+  const state = await waitForTerminalState(harness);
+  assert.equal(state.status, "done", state.error);
+  assert.deepEqual(
+    harness.requestedSegments().map(({ text }) => text),
+    [expected]
+  );
+  assert.doesNotMatch(
+    harness.requestedSegments().map(({ text }) => text).join("\n"),
+    new RegExp(
+      `${privateText}|${transparentPrivateText}|${contentsPrivateText}`
+    )
+  );
+});
+
+test("zero-width br elements still split visible flow paragraphs", async (t) => {
+  const first = "The first visible flow has a public reference and ends here.";
+  const second = "The second visible flow has another reference and stays separate.";
+  const harness = createHarness({
+    html: `
+      <main>
+        <div>
+          The first visible flow has <a href="#one">a public reference</a> and ends here.
+          <br><br>
+          The second visible flow has <a href="#two">another reference</a> and stays separate.
+        </div>
+      </main>
+    `,
+    rectForElement(element) {
+      return element.matches("br")
+        ? { width: 0, height: 16 }
+        : { width: 640, height: 24 };
+    }
+  });
+  t.after(harness.close);
+
+  harness.start();
+  await waitForTerminalState(harness);
+  assert.deepEqual(
+    harness.requestedSegments().map(({ text }) => text),
+    [first, second]
+  );
+});
+
+test("zero-width br elements preserve structured social-post line breaks", async (t) => {
+  const firstLine = "The first structured line keeps its original boundary.";
+  const secondLine = "The second structured line must remain separate.";
+  const harness = createHarness({
+    url: "https://x.com/example/status/structured-lines",
+    html: `
+      <main>
+        <article>
+          <div data-testid="tweetText">${firstLine}<br>${secondLine}</div>
+        </article>
+      </main>
+    `,
+    rectForElement(element) {
+      return element.matches("br")
+        ? { width: 0, height: 16 }
+        : { width: 640, height: 24 };
+    }
+  });
+  t.after(harness.close);
+
+  harness.start();
+  const state = await waitForTerminalState(harness);
+  assert.equal(state.status, "done", state.error);
+  assert.deepEqual(
+    harness.requestedSegments().map(({ id, text, preserveLayout }) => [
+      id,
+      text,
+      preserveLayout
+    ]),
+    [["segment-1", `${firstLine}\n${secondLine}`, true]]
+  );
+});
+
+test("rechecks visibility after cache hydration before sending text", async (t) => {
+  const text = "This paragraph becomes hidden while its cache entry is loading.";
+  let releaseCacheRead;
+  let didStartCacheRead = false;
+  const pendingCacheRead = new Promise((resolve) => {
+    releaseCacheRead = (result = {}) => resolve(result);
+  });
+  const harness = createHarness({
+    html: `<main><p id="late-hidden">${text}</p></main>`,
+    storageLocal: {
+      async get(keys) {
+        if (keys === null || keys === undefined) {
+          didStartCacheRead = true;
+          return pendingCacheRead;
+        }
+        return {};
+      },
+      async set() {},
+      async remove() {}
+    },
+    rectForElement(element) {
+      const hidden = element.closest("[hidden]");
+      return { width: hidden ? 0 : 640, height: hidden ? 0 : 24 };
+    }
+  });
+  t.after(harness.close);
+
+  harness.start();
+  await waitFor(() => didStartCacheRead, "the persistent cache read to start");
+  harness.document.querySelector("#late-hidden").hidden = true;
+  releaseCacheRead({});
+  await new Promise((resolve) => setTimeout(resolve, 180));
+
+  assert.equal(harness.requestedSegments().length, 0);
+  assert.equal(
+    harness.document.querySelectorAll(TRANSLATION_SELECTOR).length,
+    0
+  );
+});
+
+test("does not send a flow text node moved into a hidden container during cache hydration", async (t) => {
+  const privateText = "SENSITIVE-RECOVERY-CODE-MOVED-WHILE-CACHE-LOADS";
+  let releaseCacheRead;
+  let didStartCacheRead = false;
+  const pendingCacheRead = new Promise((resolve) => {
+    releaseCacheRead = (result = {}) => resolve(result);
+  });
+  const harness = createHarness({
+    html: `
+      <main>
+        <div id="flow">${privateText} <a href="#public">public reference</a> and a visible conclusion.</div>
+        <div id="hidden-destination" hidden></div>
+      </main>
+    `,
+    storageLocal: {
+      async get(keys) {
+        if (keys === null || keys === undefined) {
+          didStartCacheRead = true;
+          return pendingCacheRead;
+        }
+        return {};
+      },
+      async set() {},
+      async remove() {}
+    }
+  });
+  t.after(harness.close);
+
+  harness.start();
+  await waitFor(() => didStartCacheRead, "the flow cache read to start");
+  const flow = harness.document.querySelector("#flow");
+  const movedTextNode = [...flow.childNodes].find(
+    (node) => node.nodeType === harness.window.Node.TEXT_NODE
+  );
+  harness.document.querySelector("#hidden-destination").append(movedTextNode);
+  releaseCacheRead({});
+  await new Promise((resolve) => setTimeout(resolve, 180));
+
+  assert.ok(
+    harness.requestedSegments().every(({ text }) => !text.includes(privateText)),
+    "the moved hidden text must not be sent even if visible remainder is rescanned"
+  );
+  assert.equal(
+    harness.document.querySelector("#hidden-destination").querySelectorAll(
+      TRANSLATION_SELECTOR
+    ).length,
+    0
   );
 });
 
@@ -671,6 +1214,595 @@ test("translations persist across a page reload via chrome.storage.local", async
     "a cached translation should not trigger a new API request"
   );
   assert.match(second.document.querySelector("#para").textContent, /【译文:/);
+});
+
+test("legacy string cache values remain readable after the cache format changes", async (t) => {
+  const html = `<main><p>A legacy cached translation should still be reused after upgrading.</p></main>`;
+  const sharedStore = {};
+  const first = createHarness({ html, storageStore: sharedStore });
+  t.after(first.close);
+  first.start();
+  await waitForTerminalState(first);
+  const cacheKey = await waitFor(
+    () => Object.keys(sharedStore).find((key) =>
+      key.startsWith("aiPageTranslatorCache:")
+    ),
+    "a cache entry to be stored"
+  );
+  const stored = sharedStore[cacheKey];
+  sharedStore[cacheKey] = typeof stored === "string" ? stored : stored.text;
+
+  const second = createHarness({ html, storageStore: sharedStore });
+  t.after(second.close);
+  second.start();
+  await waitForTerminalState(second);
+  assert.equal(second.requestedSegments().length, 0);
+});
+
+test("concurrent page contexts store self-describing entries without a shared index race", async (t) => {
+  const sharedStore = {};
+  let waitingIndexReaders = 0;
+  let releaseIndexReaders;
+  const indexBarrier = new Promise((resolve) => {
+    releaseIndexReaders = resolve;
+  });
+  const storageLocal = {
+    async get(keys) {
+      if (keys === "aiPageTranslatorCacheIndex") {
+        const snapshot = sharedStore[keys];
+        waitingIndexReaders += 1;
+        if (waitingIndexReaders === 2) {
+          releaseIndexReaders();
+        }
+        await indexBarrier;
+        return snapshot ? { [keys]: [...snapshot] } : {};
+      }
+      if (keys === undefined || keys === null) {
+        return { ...sharedStore };
+      }
+      const result = {};
+      for (const key of Array.isArray(keys) ? keys : [keys]) {
+        if (key in sharedStore) {
+          result[key] = sharedStore[key];
+        }
+      }
+      return result;
+    },
+    async set(items) { Object.assign(sharedStore, items); },
+    async remove(keys) {
+      for (const key of Array.isArray(keys) ? keys : [keys]) {
+        delete sharedStore[key];
+      }
+    }
+  };
+  const first = createHarness({
+    html: `<main><p>The first tab writes a distinct cached translation.</p></main>`,
+    url: "https://example.com/first",
+    storageLocal
+  });
+  const second = createHarness({
+    html: `<main><p>The second tab writes another cached translation.</p></main>`,
+    url: "https://example.com/second",
+    storageLocal
+  });
+  t.after(first.close);
+  t.after(second.close);
+
+  first.start();
+  second.start();
+  await Promise.all([
+    waitForTerminalState(first),
+    waitForTerminalState(second)
+  ]);
+  const entries = await waitFor(() => {
+    const values = Object.entries(sharedStore).filter(([key]) =>
+      key.startsWith("aiPageTranslatorCache:")
+    );
+    return values.length === 2 ? values : null;
+  }, "both contexts to persist their translations");
+
+  assert.equal("aiPageTranslatorCacheIndex" in sharedStore, false);
+  assert.ok(entries.every(([, value]) =>
+    value && typeof value === "object" && typeof value.text === "string"
+  ));
+});
+
+test("a cross-tab late write cannot resurrect a page cache after clear", async (t) => {
+  const sharedStore = {};
+  const storage = createStorageLocalMock(sharedStore);
+  let releaseLateWrite;
+  let lateWriteStarted = false;
+  let lateWriteCommitted = false;
+  const lateWriteBarrier = new Promise((resolve) => {
+    releaseLateWrite = resolve;
+  });
+  const delayedStorage = {
+    get: storage.get,
+    remove: storage.remove,
+    async set(items) {
+      const writesCacheValue = Object.keys(items).some((key) =>
+        key.startsWith("aiPageTranslatorCache:")
+      );
+      if (writesCacheValue && !lateWriteStarted) {
+        lateWriteStarted = true;
+        await lateWriteBarrier;
+        Object.assign(sharedStore, items);
+        lateWriteCommitted = true;
+        return;
+      }
+      Object.assign(sharedStore, items);
+    }
+  };
+  const current = createHarness({
+    html: `<main><p>The current tab has an existing page cache entry.</p></main>`,
+    url: "https://example.com/shared-page",
+    storageLocal: storage
+  });
+  const late = createHarness({
+    html: `<main><p>Another tab finishes an old translation after cache clear.</p></main>`,
+    url: "https://example.com/shared-page",
+    storageLocal: delayedStorage
+  });
+  t.after(current.close);
+  t.after(late.close);
+
+  current.start();
+  await waitForTerminalState(current);
+  await waitFor(
+    () => Object.keys(sharedStore).some((key) =>
+      key.startsWith("aiPageTranslatorCache:")
+    ),
+    "the initial cache entry"
+  );
+
+  late.start();
+  await waitForTerminalState(late);
+  await waitFor(() => lateWriteStarted, "the other tab's delayed cache write");
+  const cleared = await current.dispatchAsync({ type: "CLEAR_PAGE_CACHE" });
+  assert.equal(cleared.ok, true, cleared.error);
+  releaseLateWrite();
+  await waitFor(() => lateWriteCommitted, "the delayed write to commit");
+  await waitFor(
+    () =>
+      Object.keys(sharedStore).filter((key) =>
+        key.startsWith("aiPageTranslatorCache:")
+      ).length === 0,
+    "the stale generation write to be discarded"
+  );
+});
+
+test("clearing one page does not discard another page's in-flight cache write", async (t) => {
+  const sharedStore = {};
+  const storage = createStorageLocalMock(sharedStore);
+  let releaseOtherPageWrite;
+  let otherPageWriteStarted = false;
+  const delayedStorage = {
+    get: storage.get,
+    remove: storage.remove,
+    async set(items) {
+      if (
+        !otherPageWriteStarted &&
+        Object.keys(items).some((key) =>
+          key.startsWith("aiPageTranslatorCache:")
+        )
+      ) {
+        otherPageWriteStarted = true;
+        await new Promise((resolve) => {
+          releaseOtherPageWrite = resolve;
+        });
+      }
+      Object.assign(sharedStore, items);
+    }
+  };
+  const otherPage = createHarness({
+    html: `<main><p>A different page has a valid translation still in flight.</p></main>`,
+    url: "https://example.com/other-in-flight",
+    storageLocal: delayedStorage,
+    translate(message) {
+      return {
+        ok: true,
+        translations: Object.fromEntries(
+          message.segments.map(({ id }) => [id, "OTHER-PAGE-VALUE"])
+        )
+      };
+    }
+  });
+  const clearer = createHarness({
+    html: `<main><p>Only this page's cache should be cleared.</p></main>`,
+    url: "https://example.com/page-being-cleared",
+    storageLocal: storage
+  });
+  t.after(otherPage.close);
+  t.after(clearer.close);
+
+  otherPage.start();
+  await waitFor(() => otherPageWriteStarted, "the other page cache write");
+  const cleared = await clearer.dispatchAsync({ type: "CLEAR_PAGE_CACHE" });
+  assert.equal(cleared.ok, true, cleared.error);
+  releaseOtherPageWrite();
+  await waitFor(
+    () => Object.values(sharedStore).some(
+      (value) => value?.text === "OTHER-PAGE-VALUE"
+    ),
+    "the unrelated page cache write to remain valid"
+  );
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.ok(
+    Object.values(sharedStore).some(
+      (value) => value?.text === "OTHER-PAGE-VALUE"
+    )
+  );
+});
+
+test("a stale write stays invalid after its page tombstone expires", async (t) => {
+  const sharedStore = {};
+  const storage = createStorageLocalMock(sharedStore);
+  let releaseLateWrite;
+  let lateWriteStarted = false;
+  const delayedStorage = {
+    get: storage.get,
+    remove: storage.remove,
+    async set(items) {
+      if (
+        !lateWriteStarted &&
+        Object.keys(items).some((key) =>
+          key.startsWith("aiPageTranslatorCache:")
+        )
+      ) {
+        lateWriteStarted = true;
+        await new Promise((resolve) => {
+          releaseLateWrite = resolve;
+        });
+      }
+      Object.assign(sharedStore, items);
+    }
+  };
+  const late = createHarness({
+    html: `<main><p>An old sleeping tab must not restore a cleared cache.</p></main>`,
+    url: "https://example.com/sleeping-tab",
+    storageLocal: delayedStorage,
+    translate(message) {
+      return {
+        ok: true,
+        translations: Object.fromEntries(
+          message.segments.map(({ id }) => [id, "LATE-STALE-VALUE"])
+        )
+      };
+    }
+  });
+  const clearer = createHarness({
+    html: `<main><p>The active tab clears the shared page cache.</p></main>`,
+    url: "https://example.com/sleeping-tab",
+    storageLocal: storage
+  });
+  t.after(late.close);
+  t.after(clearer.close);
+
+  let lateNow = Date.now();
+  late.window.Date.now = () => lateNow;
+  late.start();
+  await waitFor(() => lateWriteStarted, "the sleeping tab cache write");
+  const cleared = await clearer.dispatchAsync({ type: "CLEAR_PAGE_CACHE" });
+  assert.equal(cleared.ok, true, cleared.error);
+  const pageGenerationKey = Object.keys(sharedStore).find((key) =>
+    key.startsWith("aiPageTranslatorCacheGeneration:")
+  );
+  assert.ok(pageGenerationKey);
+  sharedStore[pageGenerationKey].updatedAt = 0;
+
+  const maintainer = createHarness({
+    html: `<main><p>A different page triggers routine cache maintenance.</p></main>`,
+    url: "https://example.com/maintenance",
+    storageLocal: storage,
+    translate(message) {
+      return {
+        ok: true,
+        translations: Object.fromEntries(
+          message.segments.map(({ id }) => [id, "MAINTENANCE-VALUE"])
+        )
+      };
+    }
+  });
+  t.after(maintainer.close);
+  maintainer.start();
+  await waitForTerminalState(maintainer);
+  await waitFor(
+    () => !(pageGenerationKey in sharedStore),
+    "the expired empty page tombstone to be pruned"
+  );
+
+  lateNow += 2 * 60 * 60 * 1000;
+  releaseLateWrite();
+  await waitFor(
+    () => Object.values(sharedStore).some(
+      (value) => value?.text === "MAINTENANCE-VALUE"
+    ),
+    "the maintenance cache write"
+  );
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.ok(
+    Object.values(sharedStore).every(
+      (value) => value?.text !== "LATE-STALE-VALUE"
+    ),
+    "the pre-clear writer must remain stale after page metadata is reclaimed"
+  );
+});
+
+test("a delayed generation read cannot extend a pre-clear writer's lifetime", async (t) => {
+  const sharedStore = {};
+  const storage = createStorageLocalMock(sharedStore);
+  let releaseGenerationRead;
+  let generationReadStarted = false;
+  let releaseLateWrite;
+  let lateWriteStarted = false;
+  const lateStorage = {
+    remove: storage.remove,
+    async get(keys) {
+      if (!generationReadStarted && (keys === null || keys === undefined)) {
+        generationReadStarted = true;
+        const snapshot = { ...sharedStore };
+        await new Promise((resolve) => {
+          releaseGenerationRead = resolve;
+        });
+        return snapshot;
+      }
+      return storage.get(keys);
+    },
+    async set(items) {
+      if (
+        !lateWriteStarted &&
+        Object.keys(items).some((key) =>
+          key.startsWith("aiPageTranslatorCache:")
+        )
+      ) {
+        lateWriteStarted = true;
+        await new Promise((resolve) => {
+          releaseLateWrite = resolve;
+        });
+      }
+      Object.assign(sharedStore, items);
+    }
+  };
+  const late = createHarness({
+    html: `<main><p>A delayed cache read must not reset an old writer's expiry clock.</p></main>`,
+    url: "https://example.com/delayed-generation-read",
+    storageLocal: lateStorage,
+    translate(message) {
+      return {
+        ok: true,
+        translations: Object.fromEntries(
+          message.segments.map(({ id }) => [id, "DELAYED-READ-STALE"])
+        )
+      };
+    }
+  });
+  const clearer = createHarness({
+    html: `<main><p>This tab clears while the old generation read is suspended.</p></main>`,
+    url: "https://example.com/delayed-generation-read",
+    storageLocal: storage
+  });
+  t.after(late.close);
+  t.after(clearer.close);
+
+  let lateNow = Date.now();
+  late.window.Date.now = () => lateNow;
+  late.start();
+  await waitFor(() => generationReadStarted, "the generation snapshot read");
+  const cleared = await clearer.dispatchAsync({ type: "CLEAR_PAGE_CACHE" });
+  assert.equal(cleared.ok, true, cleared.error);
+  const pageGenerationKey = Object.keys(sharedStore).find((key) =>
+    key.startsWith("aiPageTranslatorCacheGeneration:")
+  );
+  assert.ok(pageGenerationKey);
+  sharedStore[pageGenerationKey].updatedAt = 0;
+
+  lateNow += 2 * 60 * 60 * 1000;
+  releaseGenerationRead();
+  await waitFor(() => lateWriteStarted, "the delayed old cache write");
+
+  const maintainer = createHarness({
+    html: `<main><p>Routine maintenance removes the expired page marker.</p></main>`,
+    url: "https://example.com/delayed-read-maintenance",
+    storageLocal: storage
+  });
+  t.after(maintainer.close);
+  maintainer.start();
+  await waitForTerminalState(maintainer);
+  await waitFor(
+    () => !(pageGenerationKey in sharedStore),
+    "the expired marker after the delayed read"
+  );
+
+  releaseLateWrite();
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.ok(
+    Object.values(sharedStore).every(
+      (value) => value?.text !== "DELAYED-READ-STALE"
+    )
+  );
+});
+
+test("an old prune snapshot cannot delete a concurrently refreshed page marker", async (t) => {
+  const sharedStore = {};
+  const storage = createStorageLocalMock(sharedStore);
+  let releaseLateWrite;
+  let lateWriteStarted = false;
+  const lateStorage = {
+    get: storage.get,
+    remove: storage.remove,
+    async set(items) {
+      if (
+        !lateWriteStarted &&
+        Object.keys(items).some((key) =>
+          key.startsWith("aiPageTranslatorCache:")
+        )
+      ) {
+        lateWriteStarted = true;
+        await new Promise((resolve) => {
+          releaseLateWrite = resolve;
+        });
+      }
+      Object.assign(sharedStore, items);
+    }
+  };
+  const pageUrl = "https://example.com/concurrent-marker-refresh";
+  const late = createHarness({
+    html: `<main><p>An old writer waits across two cache clears.</p></main>`,
+    url: pageUrl,
+    storageLocal: lateStorage,
+    translate(message) {
+      return {
+        ok: true,
+        translations: Object.fromEntries(
+          message.segments.map(({ id }) => [id, "PRUNE-RACE-STALE"])
+        )
+      };
+    }
+  });
+  const clearer = createHarness({
+    html: `<main><p>The current page refreshes its generation marker.</p></main>`,
+    url: pageUrl,
+    storageLocal: storage
+  });
+  t.after(late.close);
+  t.after(clearer.close);
+
+  late.start();
+  await waitFor(() => lateWriteStarted, "the pre-clear cache write");
+  const firstClear = await clearer.dispatchAsync({ type: "CLEAR_PAGE_CACHE" });
+  assert.equal(firstClear.ok, true, firstClear.error);
+  const oldMarkerKey = Object.keys(sharedStore).find((key) =>
+    key.startsWith("aiPageTranslatorCacheGeneration:")
+  );
+  assert.ok(oldMarkerKey);
+  sharedStore[oldMarkerKey].updatedAt = 0;
+
+  let nullReads = 0;
+  let pruneSnapshotStarted = false;
+  let releasePruneSnapshot;
+  const maintenanceStorage = {
+    set: storage.set,
+    remove: storage.remove,
+    async get(keys) {
+      if (keys === null || keys === undefined) {
+        nullReads += 1;
+        if (nullReads === 3) {
+          pruneSnapshotStarted = true;
+          const snapshot = { ...sharedStore };
+          await new Promise((resolve) => {
+            releasePruneSnapshot = resolve;
+          });
+          return snapshot;
+        }
+      }
+      return storage.get(keys);
+    }
+  };
+  const maintainer = createHarness({
+    html: `<main><p>A separate page begins pruning an old metadata snapshot.</p></main>`,
+    url: "https://example.com/prune-snapshot-maintainer",
+    storageLocal: maintenanceStorage
+  });
+  t.after(maintainer.close);
+  maintainer.start();
+  await waitFor(() => pruneSnapshotStarted, "the stale prune snapshot");
+
+  const secondClear = await clearer.dispatchAsync({ type: "CLEAR_PAGE_CACHE" });
+  assert.equal(secondClear.ok, true, secondClear.error);
+  releasePruneSnapshot();
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  releaseLateWrite();
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  assert.ok(
+    Object.keys(sharedStore).some((key) =>
+      key.startsWith("aiPageTranslatorCacheGeneration:")
+    ),
+    "the refreshed marker must survive deletion based on the old snapshot"
+  );
+  assert.ok(
+    Object.values(sharedStore).every(
+      (value) => value?.text !== "PRUNE-RACE-STALE"
+    )
+  );
+});
+
+test("cache eviction counts actual stored entries even when no index exists", async (t) => {
+  const sharedStore = Object.fromEntries(
+    Array.from({ length: 3000 }, (_value, index) => [
+      `aiPageTranslatorCache:seed:${String(index).padStart(4, "0")}`,
+      { text: `cached-${index}`, updatedAt: index + 1 }
+    ])
+  );
+  const harness = createHarness({
+    html: `<main><p>A new translation must evict the oldest real cache entry.</p></main>`,
+    storageStore: sharedStore
+  });
+  t.after(harness.close);
+
+  harness.start();
+  await waitForTerminalState(harness);
+  await waitFor(
+    () => Object.values(sharedStore).some(
+      (value) => value?.text === "【译文:segment-1】"
+    ),
+    "the newest cache entry to be stored"
+  );
+  const cacheKeys = Object.keys(sharedStore).filter((key) =>
+    key.startsWith("aiPageTranslatorCache:")
+  );
+  assert.equal(cacheKeys.length, 3000);
+  assert.equal("aiPageTranslatorCache:seed:0000" in sharedStore, false);
+});
+
+test("old empty cache-generation tombstones are pruned", async (t) => {
+  const oldTimestamp = Date.now() - 2 * 60 * 60 * 1000;
+  const sharedStore = Object.fromEntries(
+    Array.from({ length: 25 }, (_value, index) => [
+      `aiPageTranslatorCacheGeneration:old-${index}:generation-${index}`,
+      { updatedAt: oldTimestamp }
+    ])
+  );
+  const harness = createHarness({
+    html: `<main><p>Clearing this page also performs generation-metadata maintenance.</p></main>`,
+    storageStore: sharedStore
+  });
+  t.after(harness.close);
+
+  const response = await harness.dispatchAsync({ type: "CLEAR_PAGE_CACHE" });
+  assert.equal(response.ok, true, response.error);
+  const generationEntries = Object.entries(sharedStore).filter(([key]) =>
+    key.startsWith("aiPageTranslatorCacheGeneration:")
+  );
+  assert.equal(generationEntries.length, 1);
+  assert.ok(generationEntries[0][1].updatedAt > oldTimestamp);
+});
+
+test("CLEAR_PAGE_CACHE removes real page entries even without the legacy index", async (t) => {
+  const sharedStore = {};
+  const harness = createHarness({
+    html: `<main><p>Unindexed page cache data must still be clearable.</p></main>`,
+    storageStore: sharedStore
+  });
+  t.after(harness.close);
+  harness.start();
+  await waitForTerminalState(harness);
+  await waitFor(
+    () => Object.keys(sharedStore).some((key) =>
+      key.startsWith("aiPageTranslatorCache:")
+    ),
+    "the page cache entry to be stored"
+  );
+  delete sharedStore.aiPageTranslatorCacheIndex;
+
+  const response = await harness.dispatchAsync({ type: "CLEAR_PAGE_CACHE" });
+  assert.equal(response.ok, true, response.error);
+  assert.deepEqual(
+    Object.keys(sharedStore).filter((key) =>
+      key.startsWith("aiPageTranslatorCache:")
+    ),
+    []
+  );
 });
 
 test("CLEAR_PAGE_CACHE clears only the current page's cached translations", async (t) => {
@@ -737,13 +1869,13 @@ test("CLEAR_PAGE_CACHE clears only the current page's cached translations", asyn
   );
 });
 
-test("skips content that already matches the target language without calling the backend", async (t) => {
+test("skips content only when the target script is reliably identifiable", async (t) => {
   const harness = createHarness({
-    html: `<main><p id="already-zh">这段内容已经是简体中文，不需要重新翻译。</p></main>`
+    html: `<main><p id="already-ko">이 문장은 이미 한국어이므로 다시 번역할 필요가 없습니다.</p></main>`
   });
   t.after(harness.close);
 
-  harness.start({ targetLanguage: "zh-CN" });
+  harness.start({ targetLanguage: "ko" });
   const state = await waitForTerminalState(harness);
 
   assert.equal(state.status, "done", state.error);
@@ -756,6 +1888,25 @@ test("skips content that already matches the target language without calling the
     harness.document.querySelectorAll(TRANSLATION_SELECTOR).length,
     0
   );
+});
+
+test("does not mistake Chinese source text for Japanese or another Chinese variant", async (t) => {
+  const sourceText = "这是一个需要转换语言的简体中文段落。";
+  for (const targetLanguage of ["ja", "zh-TW"]) {
+    const harness = createHarness({
+      html: `<main><p>${sourceText}</p></main>`
+    });
+    t.after(harness.close);
+
+    harness.start({ targetLanguage });
+    const state = await waitForTerminalState(harness);
+    assert.equal(state.status, "done", state.error);
+    assert.deepEqual(
+      harness.requestedSegments().map(({ text }) => text),
+      [sourceText],
+      `${targetLanguage} must not silently skip Chinese source text`
+    );
+  }
 });
 
 test("a failed batch reports every paragraph it lost, not just one", async (t) => {
@@ -800,14 +1951,57 @@ test("a failed batch reports every paragraph it lost, not just one", async (t) =
   );
 });
 
-test("caching a page writes the cache index far fewer times than it has entries", async (t) => {
+test("X rescans report only placements that still fail after the final pass", async (t) => {
+  const text = "One social post should count as one failure after every retry.";
+  const alwaysFails = createHarness({
+    url: "https://x.com/example/status/1",
+    html: `<main><article><div data-testid="tweetText">${text}</div></article></main>`,
+    timerScale: 0.01,
+    translate: () => ({
+      ok: false,
+      error: "bad model output",
+      code: "MODEL_OUTPUT"
+    })
+  });
+  t.after(alwaysFails.close);
+
+  alwaysFails.start();
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  assert.equal(alwaysFails.state().status, "error");
+  assert.match(alwaysFails.state().error, /^1 处内容翻译失败/);
+
+  let attempts = 0;
+  const recovers = createHarness({
+    url: "https://x.com/example/status/2",
+    html: `<main><article><div data-testid="tweetText">${text}</div></article></main>`,
+    timerScale: 0.01,
+    translate(message) {
+      attempts += 1;
+      return attempts <= 2
+        ? { ok: false, error: "temporary failure" }
+        : successfulTranslation(message);
+    }
+  });
+  t.after(recovers.close);
+
+  recovers.start();
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  assert.equal(recovers.state().status, "done", recovers.state().error);
+  assert.equal(recovers.state().error, "");
+  assert.match(
+    recovers.document.querySelector("[data-testid='tweetText']").textContent,
+    /【译文:/
+  );
+});
+
+test("caching a page batches persistent value writes", async (t) => {
   const paragraphs = Array.from(
     { length: 10 },
     (_value, index) =>
       `Paragraph number ${index} explains a distinct part of the release process in detail.`
   );
   const store = {};
-  let indexWrites = 0;
+  let cacheWriteCalls = 0;
   const storageLocal = {
     async get(keys) {
       if (keys === undefined || keys === null) {
@@ -822,8 +2016,10 @@ test("caching a page writes the cache index far fewer times than it has entries"
       return result;
     },
     async set(items) {
-      if ("aiPageTranslatorCacheIndex" in items) {
-        indexWrites += 1;
+      if (Object.keys(items).some((key) =>
+        key.startsWith("aiPageTranslatorCache:")
+      )) {
+        cacheWriteCalls += 1;
       }
       Object.assign(store, items);
     },
@@ -858,9 +2054,9 @@ test("caching a page writes the cache index far fewer times than it has entries"
 
   assert.equal(cachedEntries.length, paragraphs.length);
   assert.ok(
-    indexWrites <= cachedEntries.length / 2,
-    `expected the index to be written far fewer than ${cachedEntries.length} ` +
-      `times, got ${indexWrites}`
+    cacheWriteCalls <= cachedEntries.length / 2,
+    `expected writes to be batched below ${cachedEntries.length}, ` +
+      `got ${cacheWriteCalls}`
   );
 });
 
@@ -1016,6 +2212,57 @@ test("a linked paragraph in a bare div is translated exactly once", async (t) =>
     harness.requestedSegments().map(({ text }) => text),
     [paragraph]
   );
+});
+
+test("retranslates a flow placement when its moved source nodes change", async (t) => {
+  const initialText =
+    "The linked source has a reference inside it and an initial explanation.";
+  const updatedText =
+    "The updated linked source has a reference inside it and a new explanation.";
+  const harness = createHarness({
+    html: `
+      <main>
+        <div id="flow">
+          The linked source has
+          <a href="#ref">a reference</a>
+          inside it and an initial explanation.
+        </div>
+      </main>
+    `,
+    translate(message) {
+      return {
+        ok: true,
+        translations: Object.fromEntries(
+          message.segments.map((segment) => [
+            segment.id,
+            `【译文:${segment.text}】`
+          ])
+        )
+      };
+    }
+  });
+  t.after(harness.close);
+
+  harness.start();
+  const firstState = await waitForTerminalState(harness);
+  assert.equal(firstState.status, "done", firstState.error);
+
+  const flow = harness.document.querySelector("#flow");
+  const original = flow.querySelector(`.${"ai-page-translator-original"}`);
+  original.firstChild.nodeValue = "The updated linked source has ";
+  original.lastChild.nodeValue = " inside it and a new explanation.";
+
+  await waitFor(
+    () => flow.textContent.includes(`【译文:${updatedText}】`),
+    "the changed flow source to be retranslated",
+    1400
+  );
+  assert.doesNotMatch(flow.textContent, new RegExp(`【译文:${initialText}】`));
+  assert.deepEqual(
+    harness.requestedSegments().map(({ text }) => text),
+    [initialText, updatedText]
+  );
+  assert.equal(flow.querySelectorAll(TRANSLATION_SELECTOR).length, 1);
 });
 
 test("an X-style paragraph with an inline-div link is translated once, without duplicated link text", async (t) => {

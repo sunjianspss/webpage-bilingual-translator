@@ -5,8 +5,7 @@
       : [0];
     let foundCandidates = false;
 
-    let totalFailures = 0;
-    let failureReason = "";
+    let finalFailures = [];
     try {
       for (const delay of rescanDelays) {
         if (delay > 0) {
@@ -15,13 +14,14 @@
         assertCurrentTask(taskId);
         const result = await translateCurrentCandidates(session);
         foundCandidates = foundCandidates || result.discovered > 0;
-        totalFailures += countFailedPlacements(result.failures);
-        failureReason = failureReason || describeFailures(result.failures);
+        finalFailures = result.failures;
       }
     } finally {
       session.initializing = false;
     }
 
+    const totalFailures = countFailedPlacements(finalFailures);
+    const failureReason = describeFailures(finalFailures);
     const hasFailures = totalFailures > 0;
     const reasonSuffix = hasFailures ? failureSuffix(failureReason) : "";
     state = {
@@ -217,6 +217,16 @@
     await hydratePersistentCache(session, [...groupsByKey.values()]);
 
     for (const group of groupsByKey.values()) {
+      const currentPlacements = group.placements.filter(
+        placementIsCurrentAndVisible
+      );
+      if (currentPlacements.length !== group.placements.length) {
+        session.rescanRequested = true;
+        group.placements = currentPlacements;
+      }
+      if (group.placements.length === 0) {
+        continue;
+      }
       if (session.translationCache.has(group.key)) {
         continue;
       }
@@ -233,7 +243,9 @@
         group
       }));
     }
-    return [...groupsByKey.values()];
+    return [...groupsByKey.values()].filter(
+      (group) => group.placements.length > 0
+    );
   }
 
   function applyTranslatedGroup(session, group, translatedText) {
@@ -247,6 +259,11 @@
         const alreadyCounted = session.countedTargets.has(
           identity
         );
+        if (!placementIsCurrentAndVisible(placement)) {
+          session.pendingRetranslationTargets.add(placement.target);
+          session.rescanRequested = true;
+          continue;
+        }
         if (
           !alreadyCounted &&
           session.usedPlacements + newPlacements >=
@@ -275,6 +292,56 @@
     });
     session.usedPlacements += newPlacements;
     group.applied = true;
+  }
+
+  function placementSourceText(placement) {
+    if (placement.targetType === "flow") {
+      return normalizeText(
+        (placement.nodes || [])
+          .filter((node) => node.isConnected)
+          .map((node) => renderedText(node))
+          .join(" ")
+      );
+    }
+    if (placement.targetType === "text") {
+      return normalizeText(placement.target?.textContent);
+    }
+    const value = renderedText(
+      placement.target,
+      Boolean(placement.structured)
+    );
+    return placement.structured
+      ? normalizeStructuredText(value)
+      : normalizeText(value);
+  }
+
+  function placementIsCurrentAndVisible(placement) {
+    if (
+      placement.targetType === "flow" &&
+      !(placement.nodes || []).every((node) => {
+        if (node.parentNode !== placement.target) {
+          return false;
+        }
+        if (node.nodeType === Node.TEXT_NODE) {
+          return textNodeIsVisiblyRendered(node);
+        }
+        if (node.nodeType !== Node.ELEMENT_NODE) {
+          return false;
+        }
+        return node.matches("br")
+          ? hasVisibleAncestry(node)
+          : isVisiblyRendered(node);
+      })
+    ) {
+      return false;
+    }
+    const visibleElement = placement.targetType === "text"
+      ? placement.target?.parentElement
+      : placement.target;
+    return Boolean(
+      isVisiblyRendered(visibleElement) &&
+      placementSourceText(placement) === placement.text
+    );
   }
 
   function placementIdentity(placement) {

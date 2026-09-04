@@ -1,8 +1,14 @@
-import { DEFAULT_SETTINGS } from "../shared.js";
+import {
+  DEFAULT_SETTINGS,
+  endpointPermissionOrigin,
+  normalizeBaseUrl
+} from "../shared.js";
 
 const TRANSLATE_COMMAND = "translate-current-page";
 const SHORTCUTS_URL = "chrome://extensions/shortcuts";
 const PROGRESS_POLL_INTERVAL_MS = 600;
+const IS_SAFARI = /\bSafari\//.test(navigator.userAgent) &&
+  !/\b(?:Chrome|Chromium|CriOS|Edg|OPR)\//.test(navigator.userAgent);
 
 const elements = {
   backend: document.querySelector("#backend"),
@@ -39,7 +45,7 @@ initialize().catch((error) => setMessage(error.message, "error"));
 
 elements.backend.addEventListener("change", () => {
   updateBackendVisibility();
-  persistForm().catch((error) => setMessage(error.message, "error"));
+  persistForm(true).catch((error) => setMessage(error.message, "error"));
 });
 
 elements.detectLocal.addEventListener("click", () => {
@@ -48,8 +54,13 @@ elements.detectLocal.addEventListener("click", () => {
   );
 });
 
+elements.localBaseUrl.addEventListener("change", () => {
+  persistChangedLocalEndpoint().catch((error) =>
+    setMessage(error.message, "error")
+  );
+});
+
 for (const input of [
-  elements.localBaseUrl,
   elements.localModel,
   elements.localApiKey,
   elements.highQualityReasoning,
@@ -110,7 +121,7 @@ async function translatePage() {
     validateSettings(nextSettings);
     if (
       nextSettings.backend === "local" &&
-      needsEndpointPermission(nextSettings.localBaseUrl)
+      endpointPermissionOrigin(nextSettings.localBaseUrl)
     ) {
       await ensureEndpointPermission(nextSettings.localBaseUrl);
     }
@@ -155,6 +166,10 @@ elements.restore.addEventListener("click", async () => {
 });
 
 elements.customizeShortcut.addEventListener("click", async () => {
+  if (IS_SAFARI) {
+    setShortcutNote("请在 Safari 设置中修改扩展快捷键");
+    return;
+  }
   try {
     await chrome.tabs.create({ url: SHORTCUTS_URL });
     window.close();
@@ -211,7 +226,7 @@ async function initialize() {
 async function refreshShortcutCommand() {
   if (!chrome.commands?.getAll) {
     setShortcutValue(defaultShortcutLabel());
-    setShortcutNote("在浏览器快捷键设置中修改");
+    setShortcutNote(shortcutSettingsNote());
     return;
   }
 
@@ -220,9 +235,15 @@ async function refreshShortcutCommand() {
   setShortcutValue(command?.shortcut || "未设置");
   setShortcutNote(
     command?.shortcut
-      ? "在浏览器快捷键设置中修改"
+      ? shortcutSettingsNote()
       : "未设置快捷键"
   );
+}
+
+function shortcutSettingsNote() {
+  return IS_SAFARI
+    ? "请在 Safari 设置中修改扩展快捷键"
+    : "在浏览器快捷键设置中修改";
 }
 
 function defaultShortcutLabel() {
@@ -276,6 +297,19 @@ async function persistForm(requestPermission = false) {
   return settings;
 }
 
+async function persistChangedLocalEndpoint() {
+  const endpointChanged =
+    normalizeBaseUrl(settings.localBaseUrl) !==
+    normalizeBaseUrl(elements.localBaseUrl.value);
+  if (endpointChanged) {
+    elements.localApiKey.value = "";
+  }
+  await persistForm(true);
+  if (endpointChanged) {
+    setMessage("API 地址已更改，原地址的 Token 已清空", "");
+  }
+}
+
 function validateSettings(value) {
   if (value.backend === "local") {
     if (!value.localBaseUrl) {
@@ -296,11 +330,10 @@ function validateSettings(value) {
 }
 
 async function ensureEndpointPermission(baseUrl) {
-  const url = new URL(baseUrl);
-  if (!needsEndpointPermission(baseUrl)) {
+  const originPattern = endpointPermissionOrigin(baseUrl);
+  if (!originPattern) {
     return;
   }
-  const originPattern = `${url.protocol}//${url.host}/*`;
   const hasPermission = await chrome.permissions.contains({
     origins: [originPattern]
   });
@@ -314,11 +347,6 @@ async function ensureEndpointPermission(baseUrl) {
   }
 }
 
-function needsEndpointPermission(baseUrl) {
-  const url = new URL(baseUrl);
-  return url.hostname !== "127.0.0.1" && url.hostname !== "localhost";
-}
-
 // 扩展没有文件系统，找不到 LM Studio 装在哪；能做的是问几个已知端口
 // 上有没有 OpenAI 兼容服务在应答。顺带把 /models 的结果填进模型下拉，
 // 手打模型名是这个界面上最容易错的一步。
@@ -327,8 +355,7 @@ async function detectLocalBackends() {
   setMessage("正在检测本地服务…", "");
   try {
     const response = await chrome.runtime.sendMessage({
-      type: "DETECT_LOCAL_BACKENDS",
-      apiKey: elements.localApiKey.value.trim()
+      type: "DETECT_LOCAL_BACKENDS"
     });
     if (!response?.ok) {
       throw new Error(response?.error || "当前平台不支持自动检测");
@@ -348,8 +375,22 @@ async function detectLocalBackends() {
       (a, b) => b.models.length - a.models.length
     );
     const chosen = ranked[0];
+    const endpointChanged =
+      normalizeBaseUrl(elements.localBaseUrl.value) !==
+      normalizeBaseUrl(chosen.baseUrl);
     elements.localBaseUrl.value = chosen.baseUrl;
+    if (endpointChanged) {
+      elements.localApiKey.value = "";
+    }
     fillModelOptions(chosen.models);
+
+    if (chosen.requiresAuth) {
+      setMessage(
+        `检测到 ${chosen.label}，请填写 API Token 和模型后再翻译`,
+        "error"
+      );
+      return;
+    }
 
     if (chosen.models.length === 0) {
       setMessage(
@@ -367,7 +408,8 @@ async function detectLocalBackends() {
 
     const others =
       ranked.length > 1 ? `，另外还发现 ${ranked.length - 1} 个` : "";
-    setMessage(`已连接 ${chosen.label}${others}`, "success");
+    const tokenReset = endpointChanged ? "，已清空原地址的 API Token" : "";
+    setMessage(`已连接 ${chosen.label}${others}${tokenReset}`, "success");
   } finally {
     elements.detectLocal.disabled = false;
   }

@@ -120,8 +120,8 @@
 
       const structured = structuredTextElements.has(element);
       const text = structured
-        ? normalizeStructuredText(element.innerText || element.textContent)
-        : normalizeText(element.innerText || element.textContent);
+        ? normalizeStructuredText(renderedText(element, true))
+        : normalizeText(renderedText(element));
       const maxLength = structured
         ? STRUCTURED_TEXT_MAX_LENGTH
         : DEFAULT_TEXT_MAX_LENGTH;
@@ -271,7 +271,7 @@
         return false;
       }
       const text = normalizeStructuredText(
-        element.innerText || element.textContent
+        renderedText(element, true)
       );
       return (
         text.length >= 20 &&
@@ -403,6 +403,9 @@
       if (container.closest(EXCLUDED_CONTAINER_SELECTOR)) {
         continue;
       }
+      if (!isVisiblyRendered(container)) {
+        continue;
+      }
       // flush() 只在 run 里含链接、且至少两个节点时才产出候选。这两个
       // 条件都不成立的容器，下面对每个子节点的 getComputedStyle 是白做的。
       if (
@@ -416,7 +419,7 @@
       let consecutiveBreaks = 0;
       const flush = () => {
         const text = normalizeText(
-          run.map((node) => node.textContent || "").join(" ")
+          run.map((node) => renderedText(node)).join(" ")
         );
         const hasLink = run.some(
           (node) =>
@@ -453,12 +456,19 @@
         }
 
         if (node.matches("br")) {
+          if (!hasVisibleAncestry(node)) {
+            continue;
+          }
           consecutiveBreaks += 1;
           if (consecutiveBreaks >= 2) {
             flush();
           } else if (run.length > 0) {
             run.push(node);
           }
+          continue;
+        }
+
+        if (!isVisiblyRendered(node)) {
           continue;
         }
 
@@ -591,16 +601,177 @@
       return false;
     }
 
-    const style = window.getComputedStyle(element);
-    if (
-      style.display === "none" ||
-      style.visibility === "hidden" ||
-      Number(style.opacity) === 0
-    ) {
+    return isVisiblyRendered(element);
+  }
+
+  function isVisiblyRendered(element) {
+    if (!hasVisibleAncestry(element)) {
       return false;
     }
-    const rect = element.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
+    let layoutElement = element;
+    while (
+      layoutElement &&
+      window.getComputedStyle(layoutElement).display === "contents"
+    ) {
+      layoutElement = layoutElement.parentElement;
+    }
+    if (!layoutElement) {
+      return false;
+    }
+    const rect = layoutElement.getBoundingClientRect();
+    return (
+      rect.width > 0 &&
+      rect.height > 0 &&
+      !isFullyClippedByOverflowAncestor(element, rect)
+    );
+  }
+
+  function isFullyClippedByOverflowAncestor(element, targetRect) {
+    for (
+      let ancestor = element?.parentElement;
+      ancestor;
+      ancestor = ancestor.parentElement
+    ) {
+      const style = window.getComputedStyle(ancestor);
+      if (style.display === "contents") {
+        continue;
+      }
+      const clipsHorizontally = overflowClips(
+        overflowAxisValue(style, "overflowX", 0)
+      );
+      const clipsVertically = overflowClips(
+        overflowAxisValue(style, "overflowY", 1)
+      );
+      if (!clipsHorizontally && !clipsVertically) {
+        continue;
+      }
+      const ancestorRect = ancestor.getBoundingClientRect();
+      if (
+        (clipsHorizontally &&
+          rectIntersectionLength(
+            targetRect,
+            ancestorRect,
+            "left",
+            "right",
+            "width"
+          ) <= 0) ||
+        (clipsVertically &&
+          rectIntersectionLength(
+            targetRect,
+            ancestorRect,
+            "top",
+            "bottom",
+            "height"
+          ) <= 0)
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function overflowAxisValue(style, property, shorthandIndex) {
+    const shorthandParts = String(style.overflow || "")
+      .toLowerCase()
+      .trim()
+      .split(/\s+/)
+      .filter(Boolean);
+    const shorthandValue = shorthandParts[shorthandIndex] ||
+      shorthandParts[0] || "";
+    const axisValue = String(style[property] || "").toLowerCase();
+    // JSDOM（以及少数旧 WebKit 构建）会把 overflow:hidden 的 shorthand
+    // 保留下来，却把两个 computed axis 错报为 visible；这时以明确的
+    // shorthand 为准。正常浏览器里轴值和 shorthand 一致。
+    if (
+      shorthandParts.length === 1 &&
+      axisValue === "visible" &&
+      shorthandValue !== "visible"
+    ) {
+      return shorthandValue;
+    }
+    return axisValue || shorthandValue;
+  }
+
+  function overflowClips(value) {
+    return String(value || "")
+      .toLowerCase()
+      .split(/\s+/)
+      .some((part) =>
+        part === "hidden" ||
+        part === "clip"
+      );
+  }
+
+  function rectIntersectionLength(
+    targetRect,
+    ancestorRect,
+    startProperty,
+    endProperty,
+    sizeProperty
+  ) {
+    const targetStart = Number.isFinite(Number(targetRect[startProperty]))
+      ? Number(targetRect[startProperty])
+      : 0;
+    const ancestorStart = Number.isFinite(Number(ancestorRect[startProperty]))
+      ? Number(ancestorRect[startProperty])
+      : 0;
+    const targetEnd = Number.isFinite(Number(targetRect[endProperty]))
+      ? Number(targetRect[endProperty])
+      : targetStart + Number(targetRect[sizeProperty] || 0);
+    const ancestorEnd = Number.isFinite(Number(ancestorRect[endProperty]))
+      ? Number(ancestorRect[endProperty])
+      : ancestorStart + Number(ancestorRect[sizeProperty] || 0);
+    return Math.min(targetEnd, ancestorEnd) -
+      Math.max(targetStart, ancestorStart);
+  }
+
+  function hasVisibleAncestry(element) {
+    if (!element?.isConnected) {
+      return false;
+    }
+    for (let current = element; current; current = current.parentElement) {
+      if (
+        current.hasAttribute("hidden") ||
+        current.getAttribute("aria-hidden") === "true"
+      ) {
+        return false;
+      }
+      const style = window.getComputedStyle(current);
+      if (
+        style.display === "none" ||
+        style.visibility === "hidden" ||
+        style.visibility === "collapse" ||
+        Number.parseFloat(style.opacity) === 0 ||
+        style.contentVisibility === "hidden" ||
+        styleFullyClipsContent(style) ||
+        filterMakesContentTransparent(style.filter)
+      ) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  function styleFullyClipsContent(style) {
+    const clip = String(style.clip || "")
+      .toLowerCase()
+      .replace(/\s+/g, "");
+    const clipPath = String(
+      style.clipPath || style.webkitClipPath || ""
+    )
+      .toLowerCase()
+      .replace(/\s+/g, "");
+    return (
+      clip === "rect(0px,0px,0px,0px)" ||
+      clip === "rect(0,0,0,0)" ||
+      /^inset\((?:50|100)%\)$/.test(clipPath)
+    );
+  }
+
+  function filterMakesContentTransparent(value) {
+    return /(?:^|\s)opacity\((?:0|0%)\)(?:\s|$)/i.test(
+      String(value || "")
+    );
   }
 
   function collectDirectTextNodes(root) {
@@ -617,12 +788,7 @@
         continue;
       }
 
-      const style = window.getComputedStyle(element);
-      if (
-        style.display === "none" ||
-        style.visibility === "hidden" ||
-        Number(style.opacity) === 0
-      ) {
+      if (!isVisiblyRendered(element)) {
         continue;
       }
 
@@ -643,6 +809,72 @@
 
   function normalizeText(value) {
     return String(value || "").replace(/\s+/g, " ").trim();
+  }
+
+  function renderedText(node, preserveLayout = false) {
+    if (node?.nodeType === Node.ELEMENT_NODE) {
+      if (!isVisiblyRendered(node)) {
+        return "";
+      }
+      return visibleTextContent(node, preserveLayout);
+    }
+    return node?.textContent || "";
+  }
+
+  function visibleTextContent(element, preserveLayout) {
+    if (preserveLayout) {
+      const chunks = [];
+      appendVisibleText(element, element, chunks);
+      return chunks.join("");
+    }
+    const text = [];
+    const walker = document.createTreeWalker(
+      element,
+      window.NodeFilter.SHOW_TEXT
+    );
+    while (walker.nextNode()) {
+      const node = walker.currentNode;
+      if (textNodeIsVisiblyRendered(node)) {
+        text.push(node.textContent || "");
+      }
+    }
+    return text.join(" ");
+  }
+
+  function appendVisibleText(node, root, chunks) {
+    if (node.nodeType === Node.TEXT_NODE) {
+      if (textNodeIsVisiblyRendered(node)) {
+        chunks.push(node.textContent || "");
+      }
+      return;
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) {
+      return;
+    }
+    if (node.matches("br")) {
+      if (hasVisibleAncestry(node)) {
+        chunks.push("\n");
+      }
+      return;
+    }
+    if (node !== root && !isVisiblyRendered(node)) {
+      return;
+    }
+    const separatesLines =
+      node !== root && BLOCK_LEVEL_TAGS.has(node.tagName);
+    if (separatesLines) {
+      chunks.push("\n");
+    }
+    for (const child of node.childNodes) {
+      appendVisibleText(child, root, chunks);
+    }
+    if (separatesLines) {
+      chunks.push("\n");
+    }
+  }
+
+  function textNodeIsVisiblyRendered(node) {
+    return isVisiblyRendered(node?.parentElement);
   }
 
   function normalizeStructuredText(value) {

@@ -4,11 +4,21 @@ import assert from "node:assert/strict";
 import {
   buildTranslationMessages,
   chatCompletionsUrl,
+  endpointPermissionOrigin,
   estimateTranslationMaxTokens,
   extractJsonObject,
   parseTranslations,
   translateWithFallback
 } from "../src/shared.js";
+
+test("builds optional endpoint permission origins only for non-loopback hosts", () => {
+  assert.equal(endpointPermissionOrigin("http://127.0.0.1:1234/v1"), "");
+  assert.equal(endpointPermissionOrigin("http://localhost:11434/v1"), "");
+  assert.equal(
+    endpointPermissionOrigin("http://192.168.1.23:1234/v1/"),
+    "http://192.168.1.23:1234/*"
+  );
+});
 
 test("builds chat completions URLs", () => {
   assert.equal(

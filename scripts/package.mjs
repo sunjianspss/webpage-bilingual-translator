@@ -29,8 +29,25 @@ export const PACKAGE_FILES = Object.freeze([
   "src/popup/popup.css"
 ]);
 
-// Chrome 的版本号规则:1 到 4 段整数,每段 0-65535,不允许前导零。
+// 浏览器商店使用 1 到 4 段整数,每段 0-65535,不允许前导零。
 const VERSION_PATTERN = /^(0|[1-9]\d*)(\.(0|[1-9]\d*)){0,3}$/;
+
+export function assertValidExtensionVersion(version) {
+  const components = String(version).split(".");
+  if (
+    typeof version !== "string" ||
+    !VERSION_PATTERN.test(version) ||
+    components.some((component) => Number(component) > 65535)
+  ) {
+    throw new Error(
+      `manifest.json 的版本号 "${version}" 不符合浏览器扩展格式要求` +
+        "(1-4 段整数,每段 0-65535,无前导零)。"
+    );
+  }
+  if (components.every((component) => Number(component) === 0)) {
+    throw new Error(`manifest.json 的版本号 "${version}" 不能全为 0。`);
+  }
+}
 
 export async function readJson(relativePath) {
   return JSON.parse(await readFile(new URL(relativePath, ROOT), "utf8"));
@@ -49,12 +66,7 @@ export async function resolveVersion(expectedVersion) {
     );
   }
 
-  if (!VERSION_PATTERN.test(manifest.version)) {
-    throw new Error(
-      `manifest.json 的版本号 "${manifest.version}" 不符合 Chrome 的格式要求` +
-        "(1-4 段整数,每段 0-65535,无前导零)。"
-    );
-  }
+  assertValidExtensionVersion(manifest.version);
 
   if (expectedVersion && expectedVersion !== manifest.version) {
     throw new Error(

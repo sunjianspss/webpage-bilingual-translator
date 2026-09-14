@@ -2,6 +2,52 @@
 
 ## Unreleased
 
+## v0.1.6 - 2026-09-14
+
+### Fixed
+
+- Scrolling a page while it was being translated cancelled the translation. A
+  tab reporting status `loading` was read as proof its document had gone away,
+  but on a site that prefetches routes the tab flips in and out of loading as
+  links enter the viewport, with no navigation and no URL in the event. The
+  listener now acts only on a changed URL; a document that is genuinely leaving
+  is reported by the content script's `pagehide`, which is what that event is
+  for.
+- Clicking an entry in a page's table of contents cancelled the translation for
+  the same reason. Jobs are now bound to a document rather than a tab, so a URL
+  that differs only by fragment leaves the job alone.
+- Pressing the translate shortcut a second time while a page was still being
+  translated cancelled the run in progress. The guard that should have refused
+  the second press read a status field that resets at the end of every scan, so
+  a press landing between scans went straight through.
+- A translation was abandoned when the extension failed to deliver the start
+  message. A broken message port says nothing about whether the page took the
+  job, and destroying a job the page is using costs a whole translation, while
+  leaving one behind costs a settings snapshot that tab teardown collects.
+- A lost background job ended the page. Manifest V3 recycles the service worker,
+  and `chrome.storage.session` is absent on Safari, so the record can vanish
+  while the page is half done; the page now asks for a replacement job and
+  finishes the remaining batches. A deliberate cancel is still final.
+- Article titles and standfirsts were skipped on news sites and blogs. A
+  `header` inside an `article` or `section` is sectioning content, not site
+  furniture, and was being excluded along with real page headers.
+- Restoring the original text left an empty `style` attribute on every element
+  that had been translated, because removing a custom property does not remove
+  the attribute it lives in. A site's own `p:not([style])` rules stopped
+  matching after a restore.
+- A heading whose font size could not be read produced `NaNpx`, which made the
+  translated heading fall back to an inherited size.
+
+### Added
+
+- The per-page translation cap is now editable in the popup, between 1 and 5000.
+  It had been a constant that could not be seen or changed.
+- The status bar and the popup now say how much a page's translation left out
+  when that cap binds. A long page stopping halfway used to read exactly like a
+  short page finishing.
+- Cancellations now name their origin — a navigation, a closed tab, the popup,
+  the page itself — instead of sharing one sentence between six code paths, and
+  each abort is recorded in the service worker console.
 - Added `PRIVACY.md`, stating what leaves the browser, what is kept in extension
   storage, and why each permission is requested. Required for a Chrome Web Store
   listing, and the port probing added in v0.1.5 is the kind of behavior a policy
@@ -9,6 +55,13 @@
 - Added tests that pin the policy to the code: the probed ports, the cache cap,
   the default endpoint and every declared permission must match, and a new
   external host anywhere in the shipped code fails the suite.
+
+### Changed
+
+- The element font-size variable moved onto the translation node, where it is
+  the only thing that reads it, so translating no longer writes to the page's
+  own elements.
+
 
 ## v0.1.5 - 2026-08-19
 

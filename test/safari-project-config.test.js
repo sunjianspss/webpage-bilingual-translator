@@ -23,10 +23,10 @@ test("Safari targets support macOS 10.14 and later", async () => {
   assert.deepEqual([...new Set(deploymentTargets)], ["10.14"]);
 });
 
-test("Safari app and extension report release version 0.1.5", async () => {
+test("Safari app and extension report release version 0.1.6", async () => {
   const project = await readFile(PROJECT_FILE, "utf8");
   const marketingVersions = buildSettingValues(project, "MARKETING_VERSION");
 
   assert.ok(marketingVersions.length > 0, "missing marketing version");
-  assert.deepEqual([...new Set(marketingVersions)], ["0.1.5"]);
+  assert.deepEqual([...new Set(marketingVersions)], ["0.1.6"]);
 });

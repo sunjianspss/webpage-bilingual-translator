@@ -144,6 +144,11 @@ async function translatePage() {
     if (response?.canceled) {
       return;
     }
+    // 送不到就不能断定页面没接下这个任务，销毁它可能正好掐死一轮正在跑
+    // 的翻译。留一个无人认领的任务代价小得多。
+    if (response?.delivered === false) {
+      jobId = "";
+    }
     if (!response?.ok) {
       throw new Error(response?.error || "翻译失败");
     }
@@ -491,12 +496,18 @@ async function ensureContentScript() {
 
 async function sendToPage(message) {
   if (!activeTab?.id) {
-    return { ok: false, error: "没有找到当前页面" };
+    return { ok: false, delivered: false, error: "没有找到当前页面" };
   }
   try {
     return await chrome.tabs.sendMessage(activeTab.id, message);
   } catch {
-    return { ok: false, error: "扩展尚未连接页面，请刷新页面" };
+    // delivered:false 表示"这条消息没能送到"，和页面明确回绝是两回事：
+    // 前者说明不了页面有没有接下任务，不能据此销毁它。
+    return {
+      ok: false,
+      delivered: false,
+      error: "扩展尚未连接页面，请刷新页面"
+    };
   }
 }
 

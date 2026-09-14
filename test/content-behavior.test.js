@@ -2500,3 +2500,81 @@ test("an abandoned job stays fatal so cancelling still stops the page", async (t
     "a deliberate cancel must not be resurrected"
   );
 });
+
+test("a second shortcut press mid-run must not cancel the pass in flight", async (t) => {
+  const posts = Array.from(
+    { length: 6 },
+    (_value, index) =>
+      `<article><div data-testid="tweetText">Social post number ${index + 1} is long enough to be collected here.</div></article>`
+  ).join("");
+  // 多轮扫描的页面才暴露得出这个窗口：translateCurrentCandidates 每跑完
+  // 一轮就把 state.status 写回 "done"，而 translatePage 还在两轮之间的
+  // wait() 里等着。此刻按下的那一次，旧守卫是放行的。
+  const harness = createHarness({
+    url: "https://x.com/home",
+    html: `<main>${posts}</main>`
+  });
+  t.after(harness.close);
+
+  harness.start();
+  await waitFor(
+    () => harness.state().status === "done",
+    "the first pass to report done while later passes are still queued",
+    2000
+  );
+
+  const secondPress = harness.dispatch({
+    type: "TRANSLATE_PAGE",
+    jobId: "job-second-press",
+    settings: {
+      backend: "deepseek",
+      targetLanguage: "zh-CN",
+      viewMode: "bilingual",
+      maxSegments: 220
+    }
+  });
+  assert.equal(
+    secondPress.ok,
+    false,
+    "a press arriving between passes must not restart the run"
+  );
+  assert.equal(secondPress.code, "TRANSLATION_IN_PROGRESS");
+
+  // 快捷键那条路会把这次失败回送到页面上。它属于另一次启动尝试，不该
+  // 盖掉正在跑的那一轮的进度。
+  harness.dispatch({
+    type: "SHOW_TRANSLATION_ERROR",
+    error: "页面正在翻译，请稍候"
+  });
+  assert.notEqual(harness.state().status, "error");
+
+  assert.deepEqual(
+    harness.runtimeMessages.filter(
+      (message) => message?.type === "CANCEL_TRANSLATION_JOB"
+    ),
+    [],
+    "nothing may cancel the job the page is still translating with"
+  );
+});
+
+test("a press after the pass has settled starts a fresh one", async (t) => {
+  const harness = createHarness({
+    html: "<body><article><p>A paragraph long enough to collect here.</p></article></body>"
+  });
+  t.after(harness.close);
+
+  harness.start();
+  await waitForTerminalState(harness);
+
+  const secondPress = harness.dispatch({
+    type: "TRANSLATE_PAGE",
+    jobId: "job-later-press",
+    settings: {
+      backend: "deepseek",
+      targetLanguage: "zh-CN",
+      viewMode: "bilingual",
+      maxSegments: 220
+    }
+  });
+  assert.equal(secondPress.ok, true, "a finished page must be retranslatable");
+});

@@ -463,18 +463,24 @@ async function translateActiveTabFromCommand() {
     const settings = await loadTranslatorSettings();
     await checkTranslationBackend(settings);
     const job = await createTranslationJob(settings, tab.id, tab.url);
-    try {
-      const response = await chrome.tabs.sendMessage(tab.id, {
-        type: "TRANSLATE_PAGE",
-        jobId: job.jobId,
-        pageSettings: job.pageSettings
-      });
-      if (!response?.ok) {
-        throw new Error(response?.error || "翻译失败");
-      }
-    } catch (error) {
-      await disposeTranslationJob(job.jobId, "页面没有接下任务");
-      throw error;
+    // 端口断了说明不了页面有没有接下任务。销毁一个正在用的任务，会让在
+    // 飞的批次全部报"已取消"，半页原文就留在那里；留下一个没人认领的任
+    // 务只是一份设置快照，标签页关闭或跳转时自会回收。所以只在页面明确
+    // 回绝时才销毁，发送失败时宁可漏一个。
+    const response = await chrome.tabs.sendMessage(tab.id, {
+      type: "TRANSLATE_PAGE",
+      jobId: job.jobId,
+      pageSettings: job.pageSettings
+    });
+    // 页面已经在翻了不是错误，是这一次按键没事可做。再往页面上糊一条红
+    // 字，只会盖掉那一轮真正的进度。
+    if (response?.code === "TRANSLATION_IN_PROGRESS") {
+      await disposeTranslationJob(job.jobId, "页面已有翻译在进行");
+      return;
+    }
+    if (!response?.ok) {
+      await disposeTranslationJob(job.jobId, "页面回绝了任务");
+      throw new Error(response?.error || "翻译失败");
     }
   } catch (error) {
     // 快捷键路径没有弹窗可以显示错误，只能把原因送回页面的状态条。

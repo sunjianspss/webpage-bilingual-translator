@@ -127,6 +127,12 @@
     // 不接住它，用户按下快捷键就只会看到“什么都没发生”。
     if (message?.type === "SHOW_TRANSLATION_ERROR") {
       const errorText = String(message.error || "翻译失败");
+      // 这条消息来自另一次启动尝试，不是正在跑的那一轮。让它把进度条改写
+      // 成红字，用户会以为自己这一页翻译失败了，其实它还在正常往下翻。
+      if (activeSession?.running) {
+        sendResponse({ ok: true, state });
+        return false;
+      }
       state = { ...state, status: "error", error: errorText };
       showStatus(errorText, "error");
       sendResponse({ ok: true, state });
@@ -134,9 +140,15 @@
     }
 
     if (message?.type === "TRANSLATE_PAGE") {
-      if (state.status === "translating") {
+      // 不能拿 state.status 当"还在翻"的依据：每一轮扫描结束都会把它写成
+      // "done"，整页翻译期间它会反复落回去。此时再按一次快捷键就绕过了这
+      // 道门，startTranslation 会 cancelSession 掉正在跑的那个会话——后台
+      // 任务随之中止，在飞的批次全部报"翻译任务已取消"，页面就停在刚翻出
+      // 来的那几段上。会话自己的 running 才是这一轮有没有跑完的事实。
+      if (activeSession?.running) {
         sendResponse({
           ok: false,
+          code: "TRANSLATION_IN_PROGRESS",
           error: "页面正在翻译，请稍候",
           state
         });
@@ -222,6 +234,9 @@
       statusHideTimer: null,
       scanRunning: false,
       rescanRequested: false,
+      // 这一轮整页翻译有没有跑完。state.status 每轮扫描都会落回 "done"，
+      // 说明不了这件事。
+      running: true,
       // 后台任务丢了时共用的那一次续期往返，每个会话只做一次。
       jobRenewal: null,
       initializing: true,
@@ -445,6 +460,7 @@
       }
     } finally {
       session.initializing = false;
+      session.running = false;
     }
 
     const totalFailures = countFailedPlacements(finalFailures);

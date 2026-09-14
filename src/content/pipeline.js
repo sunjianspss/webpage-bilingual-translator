@@ -29,6 +29,7 @@
       }
     } finally {
       session.initializing = false;
+      session.running = false;
     }
 
     const totalFailures = countFailedPlacements(finalFailures);

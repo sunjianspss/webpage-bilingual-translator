@@ -33,6 +33,9 @@
       statusHideTimer: null,
       scanRunning: false,
       rescanRequested: false,
+      // 这一轮整页翻译有没有跑完。state.status 每轮扫描都会落回 "done"，
+      // 说明不了这件事。
+      running: true,
       // 后台任务丢了时共用的那一次续期往返，每个会话只做一次。
       jobRenewal: null,
       initializing: true,

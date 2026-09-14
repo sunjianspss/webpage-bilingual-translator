@@ -39,6 +39,7 @@ let translationJobStateQueue = Promise.resolve();
 const JOB_MESSAGE_TYPES = new Set([
   "CHECK_TRANSLATION_BACKEND",
   "CREATE_TRANSLATION_JOB",
+  "RENEW_TRANSLATION_JOB",
   "TRANSLATE_BATCH",
   "CANCEL_TRANSLATION_JOB",
   "RELEASE_TRANSLATION_JOB"
@@ -72,9 +73,16 @@ chrome.tabs?.onRemoved?.addListener?.((tabId) => {
   return disposeJobsForTab(tabId).catch(logJobCleanupError);
 });
 
+// 标签页报一次 loading 不等于文档被换掉：点一下目录里的锚点、SPA 的
+// history 导航都会走到这里。按 tab 一刀切销毁任务，整页翻译会在用户滚
+// 到一半时被腰斩，页面上只剩前面几段译文和一句“翻译任务已取消”。
+// changeInfo.url 只在 URL 真的变了时才出现：没有它就是原地重载，文档一
+// 定会被替换；有它且只差 fragment，说明是同文档导航，任务还活着。
 chrome.tabs?.onUpdated?.addListener?.((tabId, changeInfo) => {
   if (changeInfo?.status === "loading") {
-    return disposeJobsForTab(tabId).catch(logJobCleanupError);
+    return disposeJobsForTab(tabId, changeInfo.url).catch(
+      logJobCleanupError
+    );
   }
 });
 
@@ -91,7 +99,19 @@ async function handleJobMessage(message, sender) {
   if (message.type === "CREATE_TRANSLATION_JOB") {
     const job = await createTranslationJob(
       message.settings,
-      message.tabId
+      message.tabId,
+      message.tabUrl
+    );
+    return {
+      ok: true,
+      ...job
+    };
+  }
+
+  if (message.type === "RENEW_TRANSLATION_JOB") {
+    const job = await renewTranslationJob(
+      sender?.tab,
+      message.targetLanguage
     );
     return {
       ok: true,
@@ -117,7 +137,7 @@ async function handleJobMessage(message, sender) {
   return { ok: true, translations };
 }
 
-async function createTranslationJob(settings, tabId) {
+async function createTranslationJob(settings, tabId, tabUrl) {
   if (!settings || typeof settings !== "object") {
     throw codedError(
       "创建翻译任务时缺少设置",
@@ -130,7 +150,7 @@ async function createTranslationJob(settings, tabId) {
     ...settings
   });
   const jobId = createJobId();
-  const job = createRuntimeTranslationJob(snapshot, tabId);
+  const job = createRuntimeTranslationJob(snapshot, tabId, tabUrl);
 
   return withTranslationJobState(async () => {
     translationJobs.set(jobId, job);
@@ -161,7 +181,8 @@ async function getTranslationJob(jobId, senderTabId) {
       if (persisted) {
         job = createRuntimeTranslationJob(
           persisted.settings,
-          persisted.tabId
+          persisted.tabId,
+          persisted.documentUrl
         );
         translationJobs.set(jobId, job);
       }
@@ -192,16 +213,22 @@ async function disposeTranslationJob(jobId) {
   });
 }
 
-async function disposeJobsForTab(tabId) {
+async function disposeJobsForTab(tabId, nextUrl) {
   return withTranslationJobState(async () => {
+    const nextDocument = documentIdentity(nextUrl);
+    const survivesNavigation = (job) =>
+      nextDocument !== null && job.documentUrl === nextDocument;
     const jobIds = new Set();
     for (const [jobId, job] of translationJobs) {
-      if (job.tabId === tabId) {
+      if (job.tabId === tabId && !survivesNavigation(job)) {
         jobIds.add(jobId);
       }
     }
     for (const persisted of await readAllPersistedTranslationJobs()) {
-      if (persisted.tabId === tabId) {
+      if (
+        persisted.tabId === tabId &&
+        !survivesNavigation(persisted)
+      ) {
         jobIds.add(persisted.jobId);
       }
     }
@@ -212,15 +239,32 @@ async function disposeJobsForTab(tabId) {
   });
 }
 
-function createRuntimeTranslationJob(settings, tabId) {
+function createRuntimeTranslationJob(settings, tabId, documentUrl) {
   return {
     settings: Object.freeze({
       ...DEFAULT_SETTINGS,
       ...settings
     }),
     controller: new AbortController(),
-    tabId: Number.isInteger(tabId) ? tabId : null
+    tabId: Number.isInteger(tabId) ? tabId : null,
+    documentUrl: documentIdentity(documentUrl)
   };
+}
+
+// 文档身份只算到 fragment 之前：#solution 和 #takeaways 是同一篇文档，
+// 换了 path 才是换了内容。解析不出来时返回 null，调用方会退回“销毁”，
+// 也就是改动前的行为。
+function documentIdentity(url) {
+  if (typeof url !== "string" || !url) {
+    return null;
+  }
+  try {
+    const parsed = new URL(url);
+    parsed.hash = "";
+    return parsed.href;
+  } catch (_error) {
+    return null;
+  }
 }
 
 function abortInMemoryTranslationJob(jobId) {
@@ -267,6 +311,7 @@ async function persistTranslationJob(jobId, job) {
       version: 1,
       jobId,
       tabId: job.tabId,
+      documentUrl: job.documentUrl,
       settings: { ...job.settings }
     }
   });
@@ -317,6 +362,7 @@ function normalizePersistedTranslationJob(record, jobId) {
   return {
     jobId,
     tabId: record.tabId,
+    documentUrl: documentIdentity(record.documentUrl),
     settings: Object.freeze({
       ...DEFAULT_SETTINGS,
       ...record.settings
@@ -349,6 +395,31 @@ async function translateBatch(segments, job) {
   return translations;
 }
 
+// 后台任务消失不一定是用户取消了：service worker 被回收、
+// chrome.storage.session 不可用时，任务记录会凭空不见，而页面那边整轮翻
+// 译才刚跑到一半。给它重建一个任务，让剩下的批次接着跑，比把半页原文留
+// 在那里强。API Key 仍然只在后台读，不经过页面。
+async function renewTranslationJob(senderTab, targetLanguage) {
+  if (!Number.isInteger(senderTab?.id)) {
+    throw codedError(
+      "翻译任务只能由页面自己续期",
+      "TRANSLATION_JOB_TAB_MISMATCH"
+    );
+  }
+  const stored = await loadTranslatorSettings();
+  // 续期读的是当前存储：用户在翻译途中改过目标语言的话，后半页会和前
+  // 半页对不上。页面报上来的是它这一轮一直在用的那个，以它为准——这是
+  // 页面唯一能影响续期的字段，端点、模型和 Key 仍然只认存储里的。
+  const settings = {
+    ...stored,
+    targetLanguage:
+      typeof targetLanguage === "string" && targetLanguage
+        ? targetLanguage
+        : stored.targetLanguage
+  };
+  return createTranslationJob(settings, senderTab.id, senderTab.url);
+}
+
 async function translateActiveTabFromCommand() {
   const [tab] = await chrome.tabs.query({
     active: true,
@@ -365,7 +436,7 @@ async function translateActiveTabFromCommand() {
   try {
     const settings = await loadTranslatorSettings();
     await checkTranslationBackend(settings);
-    const job = await createTranslationJob(settings, tab.id);
+    const job = await createTranslationJob(settings, tab.id, tab.url);
     try {
       const response = await chrome.tabs.sendMessage(tab.id, {
         type: "TRANSLATE_PAGE",

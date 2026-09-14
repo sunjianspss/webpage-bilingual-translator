@@ -22,6 +22,8 @@
       settings: nextSettings,
       maxPlacements: normalizePlacementLimit(nextSettings.maxSegments),
       usedPlacements: 0,
+      skippedPlacements: 0,
+      skippedIsLowerBound: false,
       countedTargets: new WeakSet(),
       pendingRetranslationTargets: new Set(),
       segmentCounter: 0,
@@ -31,6 +33,8 @@
       statusHideTimer: null,
       scanRunning: false,
       rescanRequested: false,
+      // 后台任务丢了时共用的那一次续期往返，每个会话只做一次。
+      jobRenewal: null,
       initializing: true,
       jobClosed: false
     };
@@ -39,6 +43,8 @@
       status: "translating",
       translated: 0,
       total: 0,
+      skipped: 0,
+      skippedIsLowerBound: false,
       viewMode: nextSettings.viewMode || "bilingual",
       error: ""
     };
@@ -169,9 +175,6 @@
         )?.remove();
         element.removeAttribute(MARKER);
         delete element.dataset.translatorTarget;
-        element.style.removeProperty(
-          "--ai-translator-element-original-size"
-        );
         continue;
       }
       const original = element.querySelector(`:scope > .${ORIGINAL_CLASS}`);
@@ -200,6 +203,8 @@
       status: "idle",
       translated: 0,
       total: 0,
+      skipped: 0,
+      skippedIsLowerBound: false,
       viewMode:
         viewMode === "translated" ? "translated" : "bilingual",
       error: ""

@@ -27,6 +27,10 @@
     `[${MARKER}], [${OWNED_MARKER}], script, style, noscript, code, pre, ` +
     "svg, canvas, iframe, textarea, input, select, " +
     "[contenteditable='true'], [aria-hidden='true'], nav, header, footer, aside";
+  // 主采集循环里"这一片是站点外壳"的判定
+  const EXCLUDED_REGION_SELECTOR =
+    "nav, header, footer, aside, [role='navigation'], " +
+    "[role='banner'], [role='contentinfo']";
   const VIEW_CLASSES = [
     "ai-page-translator-bilingual",
     "ai-page-translator-translated"
@@ -82,6 +86,8 @@
     status: "idle",
     translated: 0,
     total: 0,
+    skipped: 0,
+    skippedIsLowerBound: false,
     viewMode: "bilingual",
     error: ""
   };
@@ -175,6 +181,8 @@
       status: session.usedPlacements > 0 ? "done" : "idle",
       translated: session.usedPlacements,
       total: session.usedPlacements,
+      skipped: session.skippedPlacements,
+      skippedIsLowerBound: session.skippedIsLowerBound,
       error: ""
     };
   });
@@ -203,6 +211,8 @@
       settings: nextSettings,
       maxPlacements: normalizePlacementLimit(nextSettings.maxSegments),
       usedPlacements: 0,
+      skippedPlacements: 0,
+      skippedIsLowerBound: false,
       countedTargets: new WeakSet(),
       pendingRetranslationTargets: new Set(),
       segmentCounter: 0,
@@ -212,6 +222,8 @@
       statusHideTimer: null,
       scanRunning: false,
       rescanRequested: false,
+      // 后台任务丢了时共用的那一次续期往返，每个会话只做一次。
+      jobRenewal: null,
       initializing: true,
       jobClosed: false
     };
@@ -220,6 +232,8 @@
       status: "translating",
       translated: 0,
       total: 0,
+      skipped: 0,
+      skippedIsLowerBound: false,
       viewMode: nextSettings.viewMode || "bilingual",
       error: ""
     };
@@ -350,9 +364,6 @@
         )?.remove();
         element.removeAttribute(MARKER);
         delete element.dataset.translatorTarget;
-        element.style.removeProperty(
-          "--ai-translator-element-original-size"
-        );
         continue;
       }
       const original = element.querySelector(`:scope > .${ORIGINAL_CLASS}`);
@@ -381,6 +392,8 @@
       status: "idle",
       translated: 0,
       total: 0,
+      skipped: 0,
+      skippedIsLowerBound: false,
       viewMode:
         viewMode === "translated" ? "translated" : "bilingual",
       error: ""
@@ -399,6 +412,17 @@
       throw error;
     }
     return activeSession;
+  }
+
+  // 预算截断是静默的：候选在采集末尾就被 slice 掉了，用户只会看到一句
+  // “已翻译 N 处内容”，长页面翻到一半也长这样。把超出的数量缀在后面。
+  function placementLimitSuffix(session) {
+    if (session.skippedPlacements <= 0) {
+      return "";
+    }
+    return session.skippedIsLowerBound
+      ? `，另有至少 ${session.skippedPlacements} 处超出上限`
+      : `，另有 ${session.skippedPlacements} 处超出上限`;
   }
 
   async function translatePage(session) {
@@ -427,20 +451,23 @@
     const failureReason = describeFailures(finalFailures);
     const hasFailures = totalFailures > 0;
     const reasonSuffix = hasFailures ? failureSuffix(failureReason) : "";
+    const limitSuffix = placementLimitSuffix(session);
     state = {
       ...state,
       status: hasFailures ? "error" : "done",
       translated: session.usedPlacements,
       total: session.usedPlacements,
+      skipped: session.skippedPlacements,
+      skippedIsLowerBound: session.skippedIsLowerBound,
       error: hasFailures
         ? `${totalFailures} 处内容翻译失败${reasonSuffix}`
         : ""
     };
     showStatus(
       hasFailures
-        ? `已翻译 ${session.usedPlacements} 处内容，${totalFailures} 处失败${reasonSuffix}`
+        ? `已翻译 ${session.usedPlacements} 处内容，${totalFailures} 处失败${reasonSuffix}${limitSuffix}`
         : foundCandidates
-          ? `已翻译 ${session.usedPlacements} 处内容`
+          ? `已翻译 ${session.usedPlacements} 处内容${limitSuffix}`
           : "暂未发现正文，正在监听动态内容",
       hasFailures ? "error" : "success"
     );
@@ -471,25 +498,31 @@
     session.scanRunning = true;
     try {
       const settings = session.settings;
-      const rawCollected = collectCandidates(
+      const collection = collectCandidates(
         session.maxPlacements +
           session.pendingRetranslationTargets.size
       );
+      const rawCollected = collection.placements;
       const collected = rawCollected.filter(
         (placement) =>
           !isAlreadyTargetLanguage(placement.text, settings.targetLanguage)
       );
       let availableNewPlacements = remaining;
+      let budgetSkipped = 0;
       const placements = collected.filter((placement) => {
         if (session.countedTargets.has(placementIdentity(placement))) {
           return true;
         }
         if (availableNewPlacements <= 0) {
+          budgetSkipped += 1;
           return false;
         }
         availableNewPlacements -= 1;
         return true;
       });
+      // 每次扫描都是整页重采，所以这是“当前还差多少”的快照，不是累加量。
+      session.skippedPlacements = collection.overflow + budgetSkipped;
+      session.skippedIsLowerBound = collection.overflowApproximate;
       if (placements.length === 0) {
         return { discovered: 0, failures: [] };
       }
@@ -572,19 +605,22 @@
       const reasonSuffix = hasFailures
         ? failureSuffix(describeFailures(batchFailures))
         : "";
+      const limitSuffix = placementLimitSuffix(session);
       state = {
         ...state,
         status: hasFailures ? "error" : "done",
         translated: session.usedPlacements,
         total: session.usedPlacements,
+        skipped: session.skippedPlacements,
+      skippedIsLowerBound: session.skippedIsLowerBound,
         error: hasFailures
           ? `${failedPlacements} 处内容翻译失败${reasonSuffix}`
           : ""
       };
       showStatus(
         hasFailures
-          ? `已翻译 ${session.usedPlacements} 处内容，${failedPlacements} 处失败${reasonSuffix}`
-          : `已翻译 ${session.usedPlacements} 处内容`,
+          ? `已翻译 ${session.usedPlacements} 处内容，${failedPlacements} 处失败${reasonSuffix}${limitSuffix}`
+          : `已翻译 ${session.usedPlacements} 处内容${limitSuffix}`,
         hasFailures ? "error" : "success"
       );
       if (!hasFailures) {
@@ -881,7 +917,51 @@
     return settings?.backend !== "deepseek";
   }
 
+  // 后台任务丢了不等于用户取消了。MV3 的 service worker 被回收、
+  // chrome.storage.session 不可用时，任务记录会凭空消失——把它当致命错误
+  // 会让所有 worker 同时收工，整页只剩前面几段译文。先向后台要一个新任
+  // 务，把剩下的批次接着跑完；要不到才认输。
   async function requestTranslationBatch(batch, taskId) {
+    try {
+      return await sendTranslationBatch(batch, taskId);
+    } catch (error) {
+      if (error?.code !== "TRANSLATION_JOB_NOT_FOUND") {
+        throw error;
+      }
+      const session = assertCurrentTask(taskId);
+      await renewTranslationJob(session);
+      assertCurrentTask(taskId);
+      return await sendTranslationBatch(batch, taskId);
+    }
+  }
+
+  // 每个会话只续一次，而且所有 worker 共用同一次往返：它们会在同一瞬间
+  // 撞上同一个“任务不存在”，各建各的任务只有最后一个留得下来。
+  function renewTranslationJob(session) {
+    if (!session.jobRenewal) {
+      session.jobRenewal = requestRenewedTranslationJob(session);
+    }
+    return session.jobRenewal;
+  }
+
+  async function requestRenewedTranslationJob(session) {
+    const response = await chrome.runtime.sendMessage({
+      type: "RENEW_TRANSLATION_JOB",
+      targetLanguage: session.settings.targetLanguage
+    });
+    if (!response?.ok || !response.jobId) {
+      const error = new Error(
+        response?.error || "翻译任务不存在或已结束"
+      );
+      error.code = "TRANSLATION_JOB_NOT_FOUND";
+      error.canceled = true;
+      throw error;
+    }
+    session.jobId = response.jobId;
+    return response.jobId;
+  }
+
+  async function sendTranslationBatch(batch, taskId) {
     let lastError = "翻译请求失败";
     for (let attempt = 0; attempt < 2; attempt += 1) {
       try {
@@ -1337,15 +1417,57 @@
     return ancestors;
   }
 
+  // <article><header><h1> 是新闻站和博客最常见的标题写法。把所有 header/
+  // footer 一律当成站点外壳，等于把文章标题和导语整段漏掉。按 HTML 规范，
+  // article/section 内的 header/footer 属于分节内容而非页眉页脚——除非它
+  // 自己挂了 banner/contentinfo 这类明确的地标 role。
+  function isSectioningContentHeader(region) {
+    if (!region.matches("header, footer")) {
+      return false;
+    }
+    const role = region.getAttribute("role");
+    if (
+      role === "banner" ||
+      role === "contentinfo" ||
+      role === "navigation"
+    ) {
+      return false;
+    }
+    return Boolean(region.parentElement?.closest("article, section"));
+  }
+
+  // 最近的被排除祖先可能是文章自己的 header，但它外面还套着真正的
+  // 站点外壳，所以放行一层之后要继续往上找。
+  function closestExcludedRegion(element, selector) {
+    let region = element.closest(selector);
+    while (region && isSectioningContentHeader(region)) {
+      region = region.parentElement?.closest(selector) || null;
+    }
+    return region;
+  }
+
   function normalizePlacementLimit(value) {
     const parsed = Number.parseInt(value, 10);
     return Number.isFinite(parsed) && parsed > 0 ? parsed : 220;
   }
 
+  // 采集末尾的 slice 是长文被截断的真正落点。只返回截断后的数组，调用方
+  // 就无从分辨“页面就这么多”和“还有一大截没翻”——状态栏因此只能报出一句
+  // 心满意足的“已翻译 N 处内容”。把丢掉的数量一起带出来。
+  function withPlacementOverflow(placements, limit, scanTruncated) {
+    return {
+      placements: placements.slice(0, limit),
+      overflow: Math.max(0, placements.length - limit),
+      // 元素扫描自己也会在 limit * 3 处刹车，此时还有多少没看过是未知的。
+      // 上限调小时这条很容易触发，数字只能当下界报，不能假装精确。
+      overflowApproximate: Boolean(scanTruncated)
+    };
+  }
+
   function collectCandidates(limit) {
     const roots = collectContentRoots();
     if (roots.length === 0) {
-      return [];
+      return { placements: [], overflow: 0, overflowApproximate: false };
     }
 
     const primarySelector =
@@ -1402,9 +1524,11 @@
     // 迭代就 break，页面顶部的标题和正文根本没被采集，后面再怎么排序都
     // 救不回来。
     let collectedElements = 0;
+    let scanTruncated = false;
 
     for (const element of elements) {
       if (collectedElements >= limit * 3) {
+        scanTruncated = true;
         break;
       }
       if (
@@ -1461,7 +1585,7 @@
       flowCandidates.flatMap((candidate) => candidate.nodes)
     );
     if (useFocusedSocialExtraction) {
-      return candidates.slice(0, limit);
+      return withPlacementOverflow(candidates, limit, scanTruncated);
     }
     for (const root of roots) {
       for (const textNode of collectDirectTextNodes(root)) {
@@ -1492,9 +1616,11 @@
         break;
       }
     }
-    return sortByDocumentOrder(
-      dedupeCandidatePlacements(candidates)
-    ).slice(0, limit);
+    return withPlacementOverflow(
+      sortByDocumentOrder(dedupeCandidatePlacements(candidates)),
+      limit,
+      scanTruncated
+    );
   }
 
   // 候选是分三批拼起来的：先 flow，再 element/heading，最后裸文本节点。
@@ -1703,7 +1829,7 @@
 
     for (const container of containers) {
       // 三次 closest 各自向上走一遍祖先链，合成一个选择器只走一遍。
-      if (container.closest(EXCLUDED_CONTAINER_SELECTOR)) {
+      if (closestExcludedRegion(container, EXCLUDED_CONTAINER_SELECTOR)) {
         continue;
       }
       if (!isVisiblyRendered(container)) {
@@ -1876,8 +2002,9 @@
       return false;
     }
 
-    const excludedRegion = element.closest(
-      "nav, header, footer, aside, [role='navigation'], [role='banner'], [role='contentinfo']"
+    const excludedRegion = closestExcludedRegion(
+      element,
+      EXCLUDED_REGION_SELECTOR
     );
     if (excludedRegion && excludedRegion !== root) {
       return false;
@@ -2087,7 +2214,7 @@
     ];
 
     for (const element of elements) {
-      if (element.closest(EXCLUDED_CONTAINER_SELECTOR)) {
+      if (closestExcludedRegion(element, EXCLUDED_CONTAINER_SELECTOR)) {
         continue;
       }
 
@@ -2303,11 +2430,15 @@
     translation.lang = targetLanguage || "";
     translation.textContent = translatedText;
 
+    // 变量只被译文自己的 font-size 消费，设在译文节点上即可（heading 路径
+    // 一直是这么做的）。设到页面元素上会留下痕迹：removeProperty 清不掉
+    // style 属性本身，恢复原文后每个译过的元素都会多出一个 style=""，
+    // 站点自己的 p:not([style]) 之类选择器会因此失配。
     const originalSize = Number.parseFloat(
       window.getComputedStyle(element).fontSize
     );
     if (Number.isFinite(originalSize)) {
-      element.style.setProperty(
+      translation.style.setProperty(
         "--ai-translator-element-original-size",
         `${originalSize}px`
       );
@@ -2363,17 +2494,21 @@
     translation.dataset.translatorForHeading = "true";
     translation.lang = targetLanguage || "";
     translation.textContent = translatedText;
+    // 字号读不出来时别写出 "NaNpx"：那会让 var() 在计算时失效，译文标题
+    // 退回继承字号。element 路径一直是这么防的，这里对齐。
     const headingSize = Number.parseFloat(
       window.getComputedStyle(element).fontSize
     );
-    translation.style.setProperty(
-      "--ai-translator-heading-size",
-      `${Math.max(14, Math.min(20, headingSize * 0.62))}px`
-    );
-    translation.style.setProperty(
-      "--ai-translator-heading-original-size",
-      `${headingSize}px`
-    );
+    if (Number.isFinite(headingSize)) {
+      translation.style.setProperty(
+        "--ai-translator-heading-size",
+        `${Math.max(14, Math.min(20, headingSize * 0.62))}px`
+      );
+      translation.style.setProperty(
+        "--ai-translator-heading-original-size",
+        `${headingSize}px`
+      );
+    }
 
     element.setAttribute(MARKER, "true");
     element.dataset.translatorTarget = "heading";
@@ -2548,9 +2683,6 @@
           source.querySelector(
             `:scope > [data-translator-for-element='true']`
           )?.remove();
-          source.style.removeProperty(
-            "--ai-translator-element-original-size"
-          );
         }
         source.removeAttribute(MARKER);
         delete source.dataset.translatorTarget;

@@ -7,6 +7,7 @@ const originalSetTimeout = globalThis.setTimeout;
 
 let runtimeListener;
 let tabRemovedListener;
+let tabUpdatedListener;
 let storageReads = 0;
 let storedSettings = {};
 let fetchMode = "success";
@@ -67,6 +68,11 @@ globalThis.chrome = {
     onRemoved: {
       addListener(listener) {
         tabRemovedListener = listener;
+      }
+    },
+    onUpdated: {
+      addListener(listener) {
+        tabUpdatedListener = listener;
       }
     }
   },
@@ -528,4 +534,135 @@ test("the backend probe spends no round trip on DeepSeek", async () => {
 
   assert.deepEqual(checked, { ok: true });
   assert.equal(requests.length, requestCount);
+});
+
+test("an in-page anchor jump does not abandon a running translation", async () => {
+  const created = await dispatch({
+    type: "CREATE_TRANSLATION_JOB",
+    settings: translatorSettings(),
+    tabId: 41,
+    tabUrl: "https://vals.ai/blogs/fable-solves-cyphral-distich"
+  });
+
+  await tabUpdatedListener(41, {
+    status: "loading",
+    url: "https://vals.ai/blogs/fable-solves-cyphral-distich#solution"
+  });
+
+  const translated = await dispatch(
+    {
+      type: "TRANSLATE_BATCH",
+      jobId: created.jobId,
+      segments: [{ id: "after-anchor", text: "Hello" }]
+    },
+    { tab: { id: 41 } }
+  );
+  assert.deepEqual(translated, {
+    ok: true,
+    translations: { "after-anchor": "译文" }
+  });
+  assert.equal(hasPersistedJob(created.jobId), true);
+
+  await dispatch({
+    type: "RELEASE_TRANSLATION_JOB",
+    jobId: created.jobId
+  });
+});
+
+test("leaving the document still disposes the job", async () => {
+  const created = await dispatch({
+    type: "CREATE_TRANSLATION_JOB",
+    settings: translatorSettings(),
+    tabId: 42,
+    tabUrl: "https://vals.ai/blogs/fable-solves-cyphral-distich"
+  });
+
+  await tabUpdatedListener(42, {
+    status: "loading",
+    url: "https://vals.ai/blogs/another-post"
+  });
+
+  const afterNavigation = await dispatch(
+    {
+      type: "TRANSLATE_BATCH",
+      jobId: created.jobId,
+      segments: [{ id: "navigated", text: "Hello" }]
+    },
+    { tab: { id: 42 } }
+  );
+  assert.equal(afterNavigation.code, "TRANSLATION_JOB_NOT_FOUND");
+  assert.equal(hasPersistedJob(created.jobId), false);
+});
+
+test("reloading the same URL disposes the job", async () => {
+  const created = await dispatch({
+    type: "CREATE_TRANSLATION_JOB",
+    settings: translatorSettings(),
+    tabId: 43,
+    tabUrl: "https://vals.ai/blogs/fable-solves-cyphral-distich"
+  });
+
+  // 原地重载不带 changeInfo.url,但文档一定会被替换。
+  await tabUpdatedListener(43, { status: "loading" });
+
+  const afterReload = await dispatch(
+    {
+      type: "TRANSLATE_BATCH",
+      jobId: created.jobId,
+      segments: [{ id: "reloaded", text: "Hello" }]
+    },
+    { tab: { id: 43 } }
+  );
+  assert.equal(afterReload.code, "TRANSLATION_JOB_NOT_FOUND");
+  assert.equal(hasPersistedJob(created.jobId), false);
+});
+
+test("a page can renew a lost job without ever seeing the API key", async () => {
+  storedSettings = translatorSettings({
+    localModel: "renewed-model",
+    localApiKey: "renewed-secret",
+    targetLanguage: "ko"
+  });
+
+  const renewed = await dispatch(
+    {
+      type: "RENEW_TRANSLATION_JOB",
+      targetLanguage: "en"
+    },
+    { tab: { id: 44, url: "https://example.com/post" } }
+  );
+
+  assert.equal(renewed.ok, true);
+  assert.doesNotMatch(JSON.stringify(renewed), /renewed-secret/);
+  // 页面这一轮一直在翻英文,续期不能把后半页切成存储里的韩文。
+  assert.equal(renewed.pageSettings.targetLanguage, "en");
+
+  const translated = await dispatch(
+    {
+      type: "TRANSLATE_BATCH",
+      jobId: renewed.jobId,
+      segments: [{ id: "renewed", text: "Hello" }]
+    },
+    { tab: { id: 44 } }
+  );
+  assert.deepEqual(translated, {
+    ok: true,
+    translations: { renewed: "译文" }
+  });
+  const request = requests.at(-1);
+  assert.equal(
+    request.options.headers.Authorization,
+    "Bearer renewed-secret"
+  );
+
+  await dispatch({
+    type: "RELEASE_TRANSLATION_JOB",
+    jobId: renewed.jobId
+  });
+});
+
+test("renewal is refused when the sender is not a page", async () => {
+  const refused = await dispatch({ type: "RENEW_TRANSLATION_JOB" });
+  assert.equal(refused.ok, false);
+  assert.equal(refused.code, "TRANSLATION_JOB_TAB_MISMATCH");
 });

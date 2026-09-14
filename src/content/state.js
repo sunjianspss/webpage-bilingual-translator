@@ -19,6 +19,10 @@
     `[${MARKER}], [${OWNED_MARKER}], script, style, noscript, code, pre, ` +
     "svg, canvas, iframe, textarea, input, select, " +
     "[contenteditable='true'], [aria-hidden='true'], nav, header, footer, aside";
+  // 主采集循环里"这一片是站点外壳"的判定
+  const EXCLUDED_REGION_SELECTOR =
+    "nav, header, footer, aside, [role='navigation'], " +
+    "[role='banner'], [role='contentinfo']";
   const VIEW_CLASSES = [
     "ai-page-translator-bilingual",
     "ai-page-translator-translated"
@@ -74,6 +78,8 @@
     status: "idle",
     translated: 0,
     total: 0,
+    skipped: 0,
+    skippedIsLowerBound: false,
     viewMode: "bilingual",
     error: ""
   };
@@ -167,6 +173,8 @@
       status: session.usedPlacements > 0 ? "done" : "idle",
       translated: session.usedPlacements,
       total: session.usedPlacements,
+      skipped: session.skippedPlacements,
+      skippedIsLowerBound: session.skippedIsLowerBound,
       error: ""
     };
   });

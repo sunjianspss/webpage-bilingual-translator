@@ -356,7 +356,7 @@ test("background shortcut command injects the content script and starts translat
   assert.match(content, /type: "TRANSLATE_PAGE"/);
   assert.match(
     content,
-    /const settings = await loadTranslatorSettings\(\);\s*await assertConfiguredEndpointPermission\(settings\);\s*await checkTranslationBackend\(settings\);\s*const job = await createTranslationJob\(settings, tab\.id\);/,
+    /const settings = await loadTranslatorSettings\(\);\s*await assertConfiguredEndpointPermission\(settings\);\s*await checkTranslationBackend\(settings\);\s*const job = await createTranslationJob\(settings, tab\.id, tab\.url\);/,
     "the shortcut must verify permission and probe the backend before it starts a job"
   );
   assert.match(content, /type: "SHOW_TRANSLATION_ERROR"/);

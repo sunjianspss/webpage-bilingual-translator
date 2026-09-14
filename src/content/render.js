@@ -50,11 +50,15 @@
     translation.lang = targetLanguage || "";
     translation.textContent = translatedText;
 
+    // 变量只被译文自己的 font-size 消费，设在译文节点上即可（heading 路径
+    // 一直是这么做的）。设到页面元素上会留下痕迹：removeProperty 清不掉
+    // style 属性本身，恢复原文后每个译过的元素都会多出一个 style=""，
+    // 站点自己的 p:not([style]) 之类选择器会因此失配。
     const originalSize = Number.parseFloat(
       window.getComputedStyle(element).fontSize
     );
     if (Number.isFinite(originalSize)) {
-      element.style.setProperty(
+      translation.style.setProperty(
         "--ai-translator-element-original-size",
         `${originalSize}px`
       );
@@ -110,17 +114,21 @@
     translation.dataset.translatorForHeading = "true";
     translation.lang = targetLanguage || "";
     translation.textContent = translatedText;
+    // 字号读不出来时别写出 "NaNpx"：那会让 var() 在计算时失效，译文标题
+    // 退回继承字号。element 路径一直是这么防的，这里对齐。
     const headingSize = Number.parseFloat(
       window.getComputedStyle(element).fontSize
     );
-    translation.style.setProperty(
-      "--ai-translator-heading-size",
-      `${Math.max(14, Math.min(20, headingSize * 0.62))}px`
-    );
-    translation.style.setProperty(
-      "--ai-translator-heading-original-size",
-      `${headingSize}px`
-    );
+    if (Number.isFinite(headingSize)) {
+      translation.style.setProperty(
+        "--ai-translator-heading-size",
+        `${Math.max(14, Math.min(20, headingSize * 0.62))}px`
+      );
+      translation.style.setProperty(
+        "--ai-translator-heading-original-size",
+        `${headingSize}px`
+      );
+    }
 
     element.setAttribute(MARKER, "true");
     element.dataset.translatorTarget = "heading";

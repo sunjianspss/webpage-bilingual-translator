@@ -68,6 +68,7 @@ function createHarness({
   const { window } = dom;
   const listeners = [];
   const runtimeMessages = [];
+  let renewalCount = 0;
   if (timerScale !== 1) {
     const nativeSetTimeout = window.setTimeout.bind(window);
     window.setTimeout = (callback, delay, ...args) =>
@@ -111,6 +112,14 @@ function createHarness({
         runtimeMessages.push(message);
         if (message?.type === "TRANSLATE_BATCH") {
           return translate(message, successfulTranslation);
+        }
+        if (message?.type === "RENEW_TRANSLATION_JOB") {
+          renewalCount += 1;
+          return {
+            ok: true,
+            jobId: `renewed-job-${renewalCount}`,
+            pageSettings: {}
+          };
         }
         return { ok: true };
       }
@@ -166,6 +175,7 @@ function createHarness({
     dispatch,
     dispatchAsync,
     document: window.document,
+    renewalCount: () => renewalCount,
     requestedSegments,
     runtimeMessages,
     start,
@@ -2414,5 +2424,79 @@ test("a binding placement budget keeps the top of the document, not whatever was
     heading.nextElementSibling?.dataset.translatorForHeading,
     "true",
     "the headline must actually receive its translation block"
+  );
+});
+
+test("a lost background job is renewed instead of stranding the rest of the page", async (t) => {
+  const paragraphs = Array.from(
+    { length: 60 },
+    (_value, index) =>
+      `<p>Paragraph number ${index + 1} carries enough prose to be collected.</p>`
+  ).join("");
+  const lostJobId = "job-content-behavior";
+  const seenJobIds = new Set();
+  const harness = createHarness({
+    html: `<body><article>${paragraphs}</article></body>`,
+    translate(message) {
+      seenJobIds.add(message.jobId);
+      // service worker 被回收后,原任务记录就没了;页面这边整轮才刚开始。
+      if (message.jobId === lostJobId) {
+        return {
+          ok: false,
+          canceled: true,
+          code: "TRANSLATION_JOB_NOT_FOUND",
+          error: "翻译任务不存在或已结束"
+        };
+      }
+      return successfulTranslation(message);
+    }
+  });
+  t.after(harness.close);
+
+  harness.start();
+  const state = await waitForTerminalState(harness, 4000);
+
+  assert.equal(state.status, "done", state.error);
+  assert.equal(
+    harness.document.querySelectorAll(TRANSLATION_SELECTOR).length,
+    60,
+    "every paragraph must still get a translation"
+  );
+  assert.equal(
+    harness.renewalCount(),
+    1,
+    "concurrent workers must share one renewal round trip"
+  );
+  assert.equal(seenJobIds.has("renewed-job-1"), true);
+});
+
+test("an abandoned job stays fatal so cancelling still stops the page", async (t) => {
+  const paragraphs = Array.from(
+    { length: 60 },
+    (_value, index) =>
+      `<p>Paragraph number ${index + 1} carries enough prose to be collected.</p>`
+  ).join("");
+  const harness = createHarness({
+    html: `<body><article>${paragraphs}</article></body>`,
+    translate() {
+      return {
+        ok: false,
+        canceled: true,
+        code: "TRANSLATION_CANCELED",
+        error: "翻译任务已取消"
+      };
+    }
+  });
+  t.after(harness.close);
+
+  harness.start();
+  const state = await waitForTerminalState(harness, 4000);
+
+  assert.equal(state.status, "error");
+  assert.equal(state.error, "翻译任务已取消");
+  assert.equal(
+    harness.renewalCount(),
+    0,
+    "a deliberate cancel must not be resurrected"
   );
 });

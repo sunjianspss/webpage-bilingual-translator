@@ -288,7 +288,7 @@ test("canceling a job aborts its in-flight fetch and returns a structured error"
     ok: false,
     canceled: true,
     code: "TRANSLATION_CANCELED",
-    error: "翻译任务已取消"
+    error: "翻译任务已取消（弹窗主动取消）"
   });
   fetchMode = "success";
 });
@@ -322,7 +322,7 @@ test("releasing a job also aborts and deletes any in-flight work", async () => {
     ok: false,
     canceled: true,
     code: "TRANSLATION_CANCELED",
-    error: "翻译任务已取消"
+    error: "翻译任务已取消（弹窗释放任务）"
   });
   fetchMode = "success";
 });
@@ -665,4 +665,71 @@ test("renewal is refused when the sender is not a page", async () => {
   const refused = await dispatch({ type: "RENEW_TRANSLATION_JOB" });
   assert.equal(refused.ok, false);
   assert.equal(refused.code, "TRANSLATION_JOB_TAB_MISMATCH");
+});
+
+test("a cancelled batch names who cancelled it", async () => {
+  const created = await dispatch({
+    type: "CREATE_TRANSLATION_JOB",
+    settings: translatorSettings(),
+    tabId: 51,
+    tabUrl: "https://vals.ai/blogs/fable-solves-cyphral-distich"
+  });
+  fetchMode = "pending";
+  const started = waitForNextFetch();
+  const batchResponse = dispatch(
+    {
+      type: "TRANSLATE_BATCH",
+      jobId: created.jobId,
+      segments: [{ id: "mid-flight", text: "Hello" }]
+    },
+    { tab: { id: 51 } }
+  );
+  await started;
+
+  // 页面自己跳走了,和用户按下取消是两回事,红字必须分得清。
+  await tabUpdatedListener(51, {
+    status: "loading",
+    url: "https://vals.ai/blogs/another-post"
+  });
+
+  assert.deepEqual(await batchResponse, {
+    ok: false,
+    canceled: true,
+    code: "TRANSLATION_CANCELED",
+    error: "翻译任务已取消（页面已跳转）"
+  });
+  fetchMode = "success";
+});
+
+test("a page cancel is told apart from a popup cancel", async () => {
+  const created = await dispatch({
+    type: "CREATE_TRANSLATION_JOB",
+    settings: translatorSettings(),
+    tabId: 52,
+    tabUrl: "https://example.com/post"
+  });
+  fetchMode = "pending";
+  const started = waitForNextFetch();
+  const batchResponse = dispatch(
+    {
+      type: "TRANSLATE_BATCH",
+      jobId: created.jobId,
+      segments: [{ id: "from-page", text: "Hello" }]
+    },
+    { tab: { id: 52 } }
+  );
+  await started;
+
+  await dispatch(
+    { type: "CANCEL_TRANSLATION_JOB", jobId: created.jobId },
+    { tab: { id: 52 } }
+  );
+
+  assert.deepEqual(await batchResponse, {
+    ok: false,
+    canceled: true,
+    code: "TRANSLATION_CANCELED",
+    error: "翻译任务已取消（页面主动取消）"
+  });
+  fetchMode = "success";
 });

@@ -70,7 +70,9 @@ chrome.commands?.onCommand?.addListener((command) => {
 });
 
 chrome.tabs?.onRemoved?.addListener?.((tabId) => {
-  return disposeJobsForTab(tabId).catch(logJobCleanupError);
+  return disposeJobsForTab(tabId, undefined, "标签页已关闭").catch(
+    logJobCleanupError
+  );
 });
 
 // 标签页报一次 loading 不等于文档被换掉：点一下目录里的锚点、SPA 的
@@ -80,14 +82,20 @@ chrome.tabs?.onRemoved?.addListener?.((tabId) => {
 // 定会被替换；有它且只差 fragment，说明是同文档导航，任务还活着。
 chrome.tabs?.onUpdated?.addListener?.((tabId, changeInfo) => {
   if (changeInfo?.status === "loading") {
-    return disposeJobsForTab(tabId, changeInfo.url).catch(
-      logJobCleanupError
-    );
+    return disposeJobsForTab(
+      tabId,
+      changeInfo.url,
+      "页面已跳转"
+    ).catch(logJobCleanupError);
   }
 });
 
 chrome.tabs?.onReplaced?.addListener?.((_addedTabId, removedTabId) => {
-  return disposeJobsForTab(removedTabId).catch(logJobCleanupError);
+  return disposeJobsForTab(
+    removedTabId,
+    undefined,
+    "标签页已被替换"
+  ).catch(logJobCleanupError);
 });
 
 async function handleJobMessage(message, sender) {
@@ -119,13 +127,21 @@ async function handleJobMessage(message, sender) {
     };
   }
 
+  // 弹窗和内容脚本都会发取消,但只有内容脚本带 sender.tab。分开记,
+  // 下次读日志就不用再猜是哪一边按的。
   if (message.type === "CANCEL_TRANSLATION_JOB") {
-    await disposeTranslationJob(message.jobId);
+    await disposeTranslationJob(
+      message.jobId,
+      sender?.tab ? "页面主动取消" : "弹窗主动取消"
+    );
     return { ok: true, canceled: true };
   }
 
   if (message.type === "RELEASE_TRANSLATION_JOB") {
-    await disposeTranslationJob(message.jobId);
+    await disposeTranslationJob(
+      message.jobId,
+      sender?.tab ? "页面已卸载" : "弹窗释放任务"
+    );
     return { ok: true };
   }
 
@@ -158,7 +174,7 @@ async function createTranslationJob(settings, tabId, tabUrl) {
       await persistTranslationJob(jobId, job);
     } catch (error) {
       translationJobs.delete(jobId);
-      job.controller.abort();
+      job.controller.abort("任务未能保存");
       throw error;
     }
     return {
@@ -194,7 +210,7 @@ async function getTranslationJob(jobId, senderTabId) {
       );
     }
     if (job.controller.signal.aborted) {
-      throw canceledError();
+      throw canceledError(cancellationMessage(job.controller.signal.reason));
     }
     if (job.tabId !== null && senderTabId !== job.tabId) {
       throw codedError(
@@ -206,14 +222,14 @@ async function getTranslationJob(jobId, senderTabId) {
   });
 }
 
-async function disposeTranslationJob(jobId) {
+async function disposeTranslationJob(jobId, reason) {
   return withTranslationJobState(async () => {
-    abortInMemoryTranslationJob(jobId);
+    abortInMemoryTranslationJob(jobId, reason);
     await removePersistedTranslationJobs([jobId]);
   });
 }
 
-async function disposeJobsForTab(tabId, nextUrl) {
+async function disposeJobsForTab(tabId, nextUrl, reason) {
   return withTranslationJobState(async () => {
     const nextDocument = documentIdentity(nextUrl);
     const survivesNavigation = (job) =>
@@ -233,7 +249,7 @@ async function disposeJobsForTab(tabId, nextUrl) {
       }
     }
     for (const jobId of jobIds) {
-      abortInMemoryTranslationJob(jobId);
+      abortInMemoryTranslationJob(jobId, reason);
     }
     await removePersistedTranslationJobs([...jobIds]);
   });
@@ -267,11 +283,21 @@ function documentIdentity(url) {
   }
 }
 
-function abortInMemoryTranslationJob(jobId) {
+function abortInMemoryTranslationJob(jobId, reason) {
   const job = translationJobs.get(jobId);
   translationJobs.delete(jobId);
   if (job && !job.controller.signal.aborted) {
-    job.controller.abort();
+    // AbortSignal.reason 就是为这个存在的:飞行中的批次只拿得到 signal,
+    // 拿不到 job,靠它才能说清这一次中止是谁发起的。
+    job.controller.abort(reason);
+  }
+  // 整页翻译半路停下时,用户能看到的只有一句"翻译任务已取消"。谁中止的
+  // 在这里是确定的,写进 service worker 控制台,省得下次再靠猜。
+  if (job) {
+    console.info(
+      "翻译任务已中止",
+      JSON.stringify({ jobId, reason: reason || "未标注" })
+    );
   }
 }
 
@@ -447,7 +473,7 @@ async function translateActiveTabFromCommand() {
         throw new Error(response?.error || "翻译失败");
       }
     } catch (error) {
-      await disposeTranslationJob(job.jobId);
+      await disposeTranslationJob(job.jobId, "页面没有接下任务");
       throw error;
     }
   } catch (error) {
@@ -889,7 +915,7 @@ function releaseServiceWorkerKeepAlive() {
 function createRequestControl(jobSignal) {
   const controller = new AbortController();
   let timedOut = false;
-  const abortFromJob = () => controller.abort();
+  const abortFromJob = () => controller.abort(jobSignal.reason);
   // 请求存续期间保活，cleanup() 由 finally 保证一定会跑。
   acquireServiceWorkerKeepAlive();
 
@@ -916,7 +942,7 @@ function createRequestControl(jobSignal) {
 
 function assertRequestActive(jobSignal, requestControl) {
   if (jobSignal.aborted) {
-    throw canceledError();
+    throw canceledError(cancellationMessage(jobSignal.reason));
   }
   if (requestControl.didTimeOut()) {
     throw codedError("翻译服务请求超时", "TRANSLATION_TIMEOUT");
@@ -925,8 +951,16 @@ function assertRequestActive(jobSignal, requestControl) {
 
 function assertJobActive(jobSignal) {
   if (jobSignal.aborted) {
-    throw canceledError();
+    throw canceledError(cancellationMessage(jobSignal.reason));
   }
+}
+
+// 中止有五六个来源,共用一句"翻译任务已取消"的话,读到它的人无从分辨
+// 是自己点了取消、页面跳走了,还是后台自作主张。把来源缀在后面。
+function cancellationMessage(reason) {
+  return typeof reason === "string" && reason
+    ? `翻译任务已取消（${reason}）`
+    : "翻译任务已取消";
 }
 
 function codedError(message, code) {

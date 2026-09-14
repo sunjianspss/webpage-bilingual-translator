@@ -66,42 +66,27 @@ chrome.tabs?.onRemoved?.addListener?.((tabId) => {
   );
 });
 
-// 标签页报一次 loading 不等于文档被换掉：点一下目录里的锚点、SPA 的
-// history 导航都会走到这里。按 tab 一刀切销毁任务，整页翻译会在用户滚
-// 到一半时被腰斩，页面上只剩前面几段译文和一句“翻译任务已取消”。
-// changeInfo.url 只在 URL 真的变了时才出现：没有它就是原地重载，文档一
-// 定会被替换；有它且只差 fragment，说明是同文档导航，任务还活着。
+// status 不是"文档换了没有"的信号，它只是标签页在不在加载东西。实测：
+// 在 vals.ai 上滚一下鼠标，Next.js 按需去取路由分片，标签页的加载状态就
+// 翻一次 {status:"loading"} → {status:"complete"}，changeInfo 里连 url
+// 都没有，文档自始至终没动过。以前据此销毁任务，结果就是"翻译到一半一
+// 滚动就被取消"——页面停在已经翻出来的那几段上，红字说任务已取消。
+//
+// 真正说明文档要换的是 changeInfo.url。没有 url 的 loading 一律不管：
+// 原地重载由内容脚本的 pagehide 发 RELEASE 负责（那是文档真的要走了才
+// 会触发），标签页关闭和被替换各有自己的监听器兜底。万一哪条都没来，
+// 留下的也只是一份设置快照，等标签页关闭时一起回收——比误杀一轮正在跑
+// 的翻译便宜得多。
 chrome.tabs?.onUpdated?.addListener?.((tabId, changeInfo) => {
-  // 有人报告"翻译中一滚动就被取消"，而内容脚本侧已经排除（真实 Chrome
-  // 里边滚边翻 90/90 全部翻完，一条 CANCEL 都没发出）。那么中止只可能来
-  // 自这里。滚动本不该产生任何 tabs 事件，所以把带着活任务的标签页上收
-  // 到的每一次 onUpdated 都记下来，下一次复现就能直接看到是什么在动。
-  logTabUpdateNearLiveJob(tabId, changeInfo);
-  if (changeInfo?.status === "loading") {
-    return disposeJobsForTab(
-      tabId,
-      changeInfo.url,
-      "页面已跳转"
-    ).catch(logJobCleanupError);
-  }
-});
-
-function logTabUpdateNearLiveJob(tabId, changeInfo) {
-  let hasLiveJob = false;
-  for (const job of translationJobs.values()) {
-    if (job.tabId === tabId && !job.controller.signal.aborted) {
-      hasLiveJob = true;
-      break;
-    }
-  }
-  if (!hasLiveJob) {
+  if (!changeInfo?.url) {
     return;
   }
-  console.info(
-    "翻译期间收到 tabs.onUpdated",
-    JSON.stringify({ tabId, changeInfo: changeInfo || null })
-  );
-}
+  return disposeJobsForTab(
+    tabId,
+    changeInfo.url,
+    "页面已跳转"
+  ).catch(logJobCleanupError);
+});
 
 chrome.tabs?.onReplaced?.addListener?.((_addedTabId, removedTabId) => {
   return disposeJobsForTab(

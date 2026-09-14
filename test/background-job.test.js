@@ -545,7 +545,6 @@ test("an in-page anchor jump does not abandon a running translation", async () =
   });
 
   await tabUpdatedListener(41, {
-    status: "loading",
     url: "https://vals.ai/blogs/fable-solves-cyphral-distich#solution"
   });
 
@@ -578,7 +577,6 @@ test("leaving the document still disposes the job", async () => {
   });
 
   await tabUpdatedListener(42, {
-    status: "loading",
     url: "https://vals.ai/blogs/another-post"
   });
 
@@ -594,7 +592,7 @@ test("leaving the document still disposes the job", async () => {
   assert.equal(hasPersistedJob(created.jobId), false);
 });
 
-test("reloading the same URL disposes the job", async () => {
+test("a bare loading flip must not touch a running job", async () => {
   const created = await dispatch({
     type: "CREATE_TRANSLATION_JOB",
     settings: translatorSettings(),
@@ -602,18 +600,31 @@ test("reloading the same URL disposes the job", async () => {
     tabUrl: "https://vals.ai/blogs/fable-solves-cyphral-distich"
   });
 
-  // 原地重载不带 changeInfo.url,但文档一定会被替换。
+  // 实测：滚动页面时 Next.js 去取路由分片，标签页的加载状态会翻一次，
+  // changeInfo 里没有 url,文档从头到尾没动过。据此销毁任务，就是
+  // "翻译到一半一滚动就被取消"。
   await tabUpdatedListener(43, { status: "loading" });
+  await tabUpdatedListener(43, { status: "complete" });
 
-  const afterReload = await dispatch(
+  const stillRunning = await dispatch(
     {
       type: "TRANSLATE_BATCH",
       jobId: created.jobId,
-      segments: [{ id: "reloaded", text: "Hello" }]
+      segments: [{ id: "after-scroll", text: "Hello" }]
     },
     { tab: { id: 43 } }
   );
-  assert.equal(afterReload.code, "TRANSLATION_JOB_NOT_FOUND");
+  assert.deepEqual(stillRunning, {
+    ok: true,
+    translations: { "after-scroll": "译文" }
+  });
+  assert.equal(hasPersistedJob(created.jobId), true);
+
+  // 文档真的要走时，内容脚本的 pagehide 会发 RELEASE——那才是可信的信号。
+  await dispatch({
+    type: "RELEASE_TRANSLATION_JOB",
+    jobId: created.jobId
+  });
   assert.equal(hasPersistedJob(created.jobId), false);
 });
 
@@ -688,7 +699,6 @@ test("a cancelled batch names who cancelled it", async () => {
 
   // 页面自己跳走了,和用户按下取消是两回事,红字必须分得清。
   await tabUpdatedListener(51, {
-    status: "loading",
     url: "https://vals.ai/blogs/another-post"
   });
 

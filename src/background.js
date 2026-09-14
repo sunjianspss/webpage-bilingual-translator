@@ -130,8 +130,8 @@ async function handleJobMessage(message, sender) {
     };
   }
 
-  // 弹窗和内容脚本都会发取消,但只有内容脚本带 sender.tab。分开记,
-  // 下次读日志就不用再猜是哪一边按的。
+  // 弹窗和内容脚本都会发取消，但只有内容脚本带 sender.tab。据此区分，
+  // 用户看到的那句话才说得出是哪一边取消的。
   if (message.type === "CANCEL_TRANSLATION_JOB") {
     await disposeTranslationJob(
       message.jobId,
@@ -290,17 +290,9 @@ function abortInMemoryTranslationJob(jobId, reason) {
   const job = translationJobs.get(jobId);
   translationJobs.delete(jobId);
   if (job && !job.controller.signal.aborted) {
-    // AbortSignal.reason 就是为这个存在的:飞行中的批次只拿得到 signal,
-    // 拿不到 job,靠它才能说清这一次中止是谁发起的。
+    // AbortSignal.reason 就是为这个存在的：飞行中的批次只拿得到 signal，
+    // 拿不到 job，靠它才能说清这一次中止是谁发起的。
     job.controller.abort(reason);
-  }
-  // 整页翻译半路停下时,用户能看到的只有一句"翻译任务已取消"。谁中止的
-  // 在这里是确定的,写进 service worker 控制台,省得下次再靠猜。
-  if (job) {
-    console.info(
-      "翻译任务已中止",
-      JSON.stringify({ jobId, reason: reason || "未标注" })
-    );
   }
 }
 

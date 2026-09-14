@@ -72,6 +72,11 @@ chrome.tabs?.onRemoved?.addListener?.((tabId) => {
 // changeInfo.url 只在 URL 真的变了时才出现：没有它就是原地重载，文档一
 // 定会被替换；有它且只差 fragment，说明是同文档导航，任务还活着。
 chrome.tabs?.onUpdated?.addListener?.((tabId, changeInfo) => {
+  // 有人报告"翻译中一滚动就被取消"，而内容脚本侧已经排除（真实 Chrome
+  // 里边滚边翻 90/90 全部翻完，一条 CANCEL 都没发出）。那么中止只可能来
+  // 自这里。滚动本不该产生任何 tabs 事件，所以把带着活任务的标签页上收
+  // 到的每一次 onUpdated 都记下来，下一次复现就能直接看到是什么在动。
+  logTabUpdateNearLiveJob(tabId, changeInfo);
   if (changeInfo?.status === "loading") {
     return disposeJobsForTab(
       tabId,
@@ -80,6 +85,23 @@ chrome.tabs?.onUpdated?.addListener?.((tabId, changeInfo) => {
     ).catch(logJobCleanupError);
   }
 });
+
+function logTabUpdateNearLiveJob(tabId, changeInfo) {
+  let hasLiveJob = false;
+  for (const job of translationJobs.values()) {
+    if (job.tabId === tabId && !job.controller.signal.aborted) {
+      hasLiveJob = true;
+      break;
+    }
+  }
+  if (!hasLiveJob) {
+    return;
+  }
+  console.info(
+    "翻译期间收到 tabs.onUpdated",
+    JSON.stringify({ tabId, changeInfo: changeInfo || null })
+  );
+}
 
 chrome.tabs?.onReplaced?.addListener?.((_addedTabId, removedTabId) => {
   return disposeJobsForTab(

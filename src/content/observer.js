@@ -138,9 +138,6 @@
           source.querySelector(
             `:scope > [data-translator-for-element='true']`
           )?.remove();
-          source.style.removeProperty(
-            "--ai-translator-element-original-size"
-          );
         }
         source.removeAttribute(MARKER);
         delete source.dataset.translatorTarget;

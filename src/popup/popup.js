@@ -7,6 +7,8 @@ import {
 const TRANSLATE_COMMAND = "translate-current-page";
 const SHORTCUTS_URL = "chrome://extensions/shortcuts";
 const PROGRESS_POLL_INTERVAL_MS = 600;
+// 与 popup.html 里 #max-segments 的 max 属性保持一致
+const MAX_SEGMENTS_LIMIT = 5000;
 const IS_SAFARI = /\bSafari\//.test(navigator.userAgent) &&
   !/\b(?:Chrome|Chromium|CriOS|Edg|OPR)\//.test(navigator.userAgent);
 
@@ -25,6 +27,7 @@ const elements = {
   deepseekApiKey: document.querySelector("#deepseek-api-key"),
   deepseekModel: document.querySelector("#deepseek-model"),
   targetLanguage: document.querySelector("#target-language"),
+  maxSegments: document.querySelector("#max-segments"),
   modeButtons: [...document.querySelectorAll("[data-mode]")],
   pageTitle: document.querySelector("#page-title"),
   statusDot: document.querySelector("#status-dot"),
@@ -66,7 +69,8 @@ for (const input of [
   elements.highQualityReasoning,
   elements.deepseekApiKey,
   elements.deepseekModel,
-  elements.targetLanguage
+  elements.targetLanguage,
+  elements.maxSegments
 ]) {
   input.addEventListener("change", () => {
     persistForm().catch((error) => setMessage(error.message, "error"));
@@ -139,6 +143,11 @@ async function translatePage() {
     });
     if (response?.canceled) {
       return;
+    }
+    // 送不到就不能断定页面没接下这个任务，销毁它可能正好掐死一轮正在跑
+    // 的翻译。留一个无人认领的任务代价小得多。
+    if (response?.delivered === false) {
+      jobId = "";
     }
     if (!response?.ok) {
       throw new Error(response?.error || "翻译失败");
@@ -271,7 +280,7 @@ function readForm() {
     highQualityReasoning: elements.highQualityReasoning.checked,
     deepseekApiKey: elements.deepseekApiKey.value.trim(),
     deepseekModel: elements.deepseekModel.value,
-    maxSegments: settings.maxSegments
+    maxSegments: readMaxSegments()
   };
 }
 
@@ -284,6 +293,15 @@ function writeForm(value) {
   elements.deepseekApiKey.value = value.deepseekApiKey;
   elements.deepseekModel.value = value.deepseekModel;
   elements.targetLanguage.value = value.targetLanguage;
+  elements.maxSegments.value = value.maxSegments;
+}
+
+// 留空等于“用默认值”，而不是报错拦住用户。
+function readMaxSegments() {
+  const raw = elements.maxSegments.value.trim();
+  return raw === ""
+    ? DEFAULT_SETTINGS.maxSegments
+    : Number.parseInt(raw, 10);
 }
 
 async function persistForm(requestPermission = false) {
@@ -326,6 +344,13 @@ function validateSettings(value) {
   }
   if (value.backend === "deepseek" && !value.deepseekApiKey) {
     throw new Error("请填写 DeepSeek API Key");
+  }
+  if (
+    !Number.isInteger(value.maxSegments) ||
+    value.maxSegments < 1 ||
+    value.maxSegments > MAX_SEGMENTS_LIMIT
+  ) {
+    throw new Error(`单页翻译上限需为 1 到 ${MAX_SEGMENTS_LIMIT} 之间的整数`);
   }
 }
 
@@ -441,7 +466,9 @@ async function createTranslationJob(value) {
   const response = await chrome.runtime.sendMessage({
     type: "CREATE_TRANSLATION_JOB",
     settings: value,
-    tabId: activeTab?.id
+    tabId: activeTab?.id,
+    // 后台靠它区分“页面真的导航走了”和“只是跳了个锚点”。
+    tabUrl: activeTab?.url
   });
   if (!response?.ok || !response.jobId || !response.pageSettings) {
     throw new Error(response?.error || "无法创建翻译任务");
@@ -469,12 +496,18 @@ async function ensureContentScript() {
 
 async function sendToPage(message) {
   if (!activeTab?.id) {
-    return { ok: false, error: "没有找到当前页面" };
+    return { ok: false, delivered: false, error: "没有找到当前页面" };
   }
   try {
     return await chrome.tabs.sendMessage(activeTab.id, message);
   } catch {
-    return { ok: false, error: "扩展尚未连接页面，请刷新页面" };
+    // delivered:false 表示"这条消息没能送到"，和页面明确回绝是两回事：
+    // 前者说明不了页面有没有接下任务，不能据此销毁它。
+    return {
+      ok: false,
+      delivered: false,
+      error: "扩展尚未连接页面，请刷新页面"
+    };
   }
 }
 
@@ -530,7 +563,15 @@ function applyPageState(pageState) {
     stopProgressPolling();
   }
   if (pageState.status === "done") {
-    setMessage(`已翻译 ${pageState.translated} 处内容`, "success");
+    const skipped = pageState.skipped > 0
+      ? (pageState.skippedIsLowerBound
+        ? `，另有至少 ${pageState.skipped} 处超出上限`
+        : `，另有 ${pageState.skipped} 处超出上限`)
+      : "";
+    setMessage(
+      `已翻译 ${pageState.translated} 处内容${skipped}`,
+      "success"
+    );
     setDot("done");
   } else if (pageState.status === "translating") {
     setMessage(

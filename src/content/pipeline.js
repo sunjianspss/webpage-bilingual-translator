@@ -1,3 +1,14 @@
+  // 预算截断是静默的：候选在采集末尾就被 slice 掉了，用户只会看到一句
+  // “已翻译 N 处内容”，长页面翻到一半也长这样。把超出的数量缀在后面。
+  function placementLimitSuffix(session) {
+    if (session.skippedPlacements <= 0) {
+      return "";
+    }
+    return session.skippedIsLowerBound
+      ? `，另有至少 ${session.skippedPlacements} 处超出上限`
+      : `，另有 ${session.skippedPlacements} 处超出上限`;
+  }
+
   async function translatePage(session) {
     const { settings, taskId } = session;
     const rescanDelays = shouldRescanDynamicContent()
@@ -18,26 +29,30 @@
       }
     } finally {
       session.initializing = false;
+      session.running = false;
     }
 
     const totalFailures = countFailedPlacements(finalFailures);
     const failureReason = describeFailures(finalFailures);
     const hasFailures = totalFailures > 0;
     const reasonSuffix = hasFailures ? failureSuffix(failureReason) : "";
+    const limitSuffix = placementLimitSuffix(session);
     state = {
       ...state,
       status: hasFailures ? "error" : "done",
       translated: session.usedPlacements,
       total: session.usedPlacements,
+      skipped: session.skippedPlacements,
+      skippedIsLowerBound: session.skippedIsLowerBound,
       error: hasFailures
         ? `${totalFailures} 处内容翻译失败${reasonSuffix}`
         : ""
     };
     showStatus(
       hasFailures
-        ? `已翻译 ${session.usedPlacements} 处内容，${totalFailures} 处失败${reasonSuffix}`
+        ? `已翻译 ${session.usedPlacements} 处内容，${totalFailures} 处失败${reasonSuffix}${limitSuffix}`
         : foundCandidates
-          ? `已翻译 ${session.usedPlacements} 处内容`
+          ? `已翻译 ${session.usedPlacements} 处内容${limitSuffix}`
           : "暂未发现正文，正在监听动态内容",
       hasFailures ? "error" : "success"
     );
@@ -68,25 +83,31 @@
     session.scanRunning = true;
     try {
       const settings = session.settings;
-      const rawCollected = collectCandidates(
+      const collection = collectCandidates(
         session.maxPlacements +
           session.pendingRetranslationTargets.size
       );
+      const rawCollected = collection.placements;
       const collected = rawCollected.filter(
         (placement) =>
           !isAlreadyTargetLanguage(placement.text, settings.targetLanguage)
       );
       let availableNewPlacements = remaining;
+      let budgetSkipped = 0;
       const placements = collected.filter((placement) => {
         if (session.countedTargets.has(placementIdentity(placement))) {
           return true;
         }
         if (availableNewPlacements <= 0) {
+          budgetSkipped += 1;
           return false;
         }
         availableNewPlacements -= 1;
         return true;
       });
+      // 每次扫描都是整页重采，所以这是“当前还差多少”的快照，不是累加量。
+      session.skippedPlacements = collection.overflow + budgetSkipped;
+      session.skippedIsLowerBound = collection.overflowApproximate;
       if (placements.length === 0) {
         return { discovered: 0, failures: [] };
       }
@@ -169,19 +190,22 @@
       const reasonSuffix = hasFailures
         ? failureSuffix(describeFailures(batchFailures))
         : "";
+      const limitSuffix = placementLimitSuffix(session);
       state = {
         ...state,
         status: hasFailures ? "error" : "done",
         translated: session.usedPlacements,
         total: session.usedPlacements,
+        skipped: session.skippedPlacements,
+      skippedIsLowerBound: session.skippedIsLowerBound,
         error: hasFailures
           ? `${failedPlacements} 处内容翻译失败${reasonSuffix}`
           : ""
       };
       showStatus(
         hasFailures
-          ? `已翻译 ${session.usedPlacements} 处内容，${failedPlacements} 处失败${reasonSuffix}`
-          : `已翻译 ${session.usedPlacements} 处内容`,
+          ? `已翻译 ${session.usedPlacements} 处内容，${failedPlacements} 处失败${reasonSuffix}${limitSuffix}`
+          : `已翻译 ${session.usedPlacements} 处内容${limitSuffix}`,
         hasFailures ? "error" : "success"
       );
       if (!hasFailures) {
@@ -478,7 +502,51 @@
     return settings?.backend !== "deepseek";
   }
 
+  // 后台任务丢了不等于用户取消了。MV3 的 service worker 被回收、
+  // chrome.storage.session 不可用时，任务记录会凭空消失——把它当致命错误
+  // 会让所有 worker 同时收工，整页只剩前面几段译文。先向后台要一个新任
+  // 务，把剩下的批次接着跑完；要不到才认输。
   async function requestTranslationBatch(batch, taskId) {
+    try {
+      return await sendTranslationBatch(batch, taskId);
+    } catch (error) {
+      if (error?.code !== "TRANSLATION_JOB_NOT_FOUND") {
+        throw error;
+      }
+      const session = assertCurrentTask(taskId);
+      await renewTranslationJob(session);
+      assertCurrentTask(taskId);
+      return await sendTranslationBatch(batch, taskId);
+    }
+  }
+
+  // 每个会话只续一次，而且所有 worker 共用同一次往返：它们会在同一瞬间
+  // 撞上同一个“任务不存在”，各建各的任务只有最后一个留得下来。
+  function renewTranslationJob(session) {
+    if (!session.jobRenewal) {
+      session.jobRenewal = requestRenewedTranslationJob(session);
+    }
+    return session.jobRenewal;
+  }
+
+  async function requestRenewedTranslationJob(session) {
+    const response = await chrome.runtime.sendMessage({
+      type: "RENEW_TRANSLATION_JOB",
+      targetLanguage: session.settings.targetLanguage
+    });
+    if (!response?.ok || !response.jobId) {
+      const error = new Error(
+        response?.error || "翻译任务不存在或已结束"
+      );
+      error.code = "TRANSLATION_JOB_NOT_FOUND";
+      error.canceled = true;
+      throw error;
+    }
+    session.jobId = response.jobId;
+    return response.jobId;
+  }
+
+  async function sendTranslationBatch(batch, taskId) {
     let lastError = "翻译请求失败";
     for (let attempt = 0; attempt < 2; attempt += 1) {
       try {

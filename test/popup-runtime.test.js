@@ -177,3 +177,41 @@ test("Safari shortcut customization does not open a Chrome-only URL", async (t) 
     /Safari 设置/
   );
 });
+
+test("the page limit renders and persists so it is not stuck at the default", async (t) => {
+  const harness = await createPopupHarness();
+  t.after(harness.close);
+  const input = harness.document.querySelector("#max-segments");
+
+  assert.equal(input.value, "220", "the shipped default must be visible");
+
+  input.value = "600";
+  input.dispatchEvent(new harness.window.Event("change", { bubbles: true }));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(
+    harness.storageWrites.at(-1).translatorSettings.maxSegments,
+    600
+  );
+});
+
+test("an out-of-range page limit is reported instead of silently persisted", async (t) => {
+  const harness = await createPopupHarness();
+  t.after(harness.close);
+  const input = harness.document.querySelector("#max-segments");
+  const writesBefore = harness.storageWrites.length;
+
+  input.value = "0";
+  input.dispatchEvent(new harness.window.Event("change", { bubbles: true }));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.match(
+    harness.document.querySelector("#message").textContent,
+    /单页翻译上限/
+  );
+  assert.equal(
+    harness.storageWrites.length,
+    writesBefore,
+    "a rejected limit must not reach storage"
+  );
+});

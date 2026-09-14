@@ -99,6 +99,19 @@
         </label>
 
         <label class="field">
+          <span>单页翻译上限 <small>超出部分不翻译</small></span>
+          <input
+            id="max-segments"
+            type="number"
+            min="1"
+            max="5000"
+            step="10"
+            inputmode="numeric"
+            placeholder="220"
+          >
+        </label>
+
+        <label class="field">
           <span>目标语言</span>
           <select id="target-language">
             <option value="zh-CN">简体中文</option>

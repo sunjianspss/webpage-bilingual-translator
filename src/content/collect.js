@@ -34,15 +34,57 @@
     return ancestors;
   }
 
+  // <article><header><h1> 是新闻站和博客最常见的标题写法。把所有 header/
+  // footer 一律当成站点外壳，等于把文章标题和导语整段漏掉。按 HTML 规范，
+  // article/section 内的 header/footer 属于分节内容而非页眉页脚——除非它
+  // 自己挂了 banner/contentinfo 这类明确的地标 role。
+  function isSectioningContentHeader(region) {
+    if (!region.matches("header, footer")) {
+      return false;
+    }
+    const role = region.getAttribute("role");
+    if (
+      role === "banner" ||
+      role === "contentinfo" ||
+      role === "navigation"
+    ) {
+      return false;
+    }
+    return Boolean(region.parentElement?.closest("article, section"));
+  }
+
+  // 最近的被排除祖先可能是文章自己的 header，但它外面还套着真正的
+  // 站点外壳，所以放行一层之后要继续往上找。
+  function closestExcludedRegion(element, selector) {
+    let region = element.closest(selector);
+    while (region && isSectioningContentHeader(region)) {
+      region = region.parentElement?.closest(selector) || null;
+    }
+    return region;
+  }
+
   function normalizePlacementLimit(value) {
     const parsed = Number.parseInt(value, 10);
     return Number.isFinite(parsed) && parsed > 0 ? parsed : 220;
   }
 
+  // 采集末尾的 slice 是长文被截断的真正落点。只返回截断后的数组，调用方
+  // 就无从分辨“页面就这么多”和“还有一大截没翻”——状态栏因此只能报出一句
+  // 心满意足的“已翻译 N 处内容”。把丢掉的数量一起带出来。
+  function withPlacementOverflow(placements, limit, scanTruncated) {
+    return {
+      placements: placements.slice(0, limit),
+      overflow: Math.max(0, placements.length - limit),
+      // 元素扫描自己也会在 limit * 3 处刹车，此时还有多少没看过是未知的。
+      // 上限调小时这条很容易触发，数字只能当下界报，不能假装精确。
+      overflowApproximate: Boolean(scanTruncated)
+    };
+  }
+
   function collectCandidates(limit) {
     const roots = collectContentRoots();
     if (roots.length === 0) {
-      return [];
+      return { placements: [], overflow: 0, overflowApproximate: false };
     }
 
     const primarySelector =
@@ -99,9 +141,11 @@
     // 迭代就 break，页面顶部的标题和正文根本没被采集，后面再怎么排序都
     // 救不回来。
     let collectedElements = 0;
+    let scanTruncated = false;
 
     for (const element of elements) {
       if (collectedElements >= limit * 3) {
+        scanTruncated = true;
         break;
       }
       if (
@@ -158,7 +202,7 @@
       flowCandidates.flatMap((candidate) => candidate.nodes)
     );
     if (useFocusedSocialExtraction) {
-      return candidates.slice(0, limit);
+      return withPlacementOverflow(candidates, limit, scanTruncated);
     }
     for (const root of roots) {
       for (const textNode of collectDirectTextNodes(root)) {
@@ -189,9 +233,11 @@
         break;
       }
     }
-    return sortByDocumentOrder(
-      dedupeCandidatePlacements(candidates)
-    ).slice(0, limit);
+    return withPlacementOverflow(
+      sortByDocumentOrder(dedupeCandidatePlacements(candidates)),
+      limit,
+      scanTruncated
+    );
   }
 
   // 候选是分三批拼起来的：先 flow，再 element/heading，最后裸文本节点。
@@ -400,7 +446,7 @@
 
     for (const container of containers) {
       // 三次 closest 各自向上走一遍祖先链，合成一个选择器只走一遍。
-      if (container.closest(EXCLUDED_CONTAINER_SELECTOR)) {
+      if (closestExcludedRegion(container, EXCLUDED_CONTAINER_SELECTOR)) {
         continue;
       }
       if (!isVisiblyRendered(container)) {
@@ -573,8 +619,9 @@
       return false;
     }
 
-    const excludedRegion = element.closest(
-      "nav, header, footer, aside, [role='navigation'], [role='banner'], [role='contentinfo']"
+    const excludedRegion = closestExcludedRegion(
+      element,
+      EXCLUDED_REGION_SELECTOR
     );
     if (excludedRegion && excludedRegion !== root) {
       return false;
@@ -784,7 +831,7 @@
     ];
 
     for (const element of elements) {
-      if (element.closest(EXCLUDED_CONTAINER_SELECTOR)) {
+      if (closestExcludedRegion(element, EXCLUDED_CONTAINER_SELECTOR)) {
         continue;
       }
 

@@ -187,7 +187,7 @@ test("canceling a Safari job cancels the matching native task without fetch fall
     ok: false,
     canceled: true,
     code: "TRANSLATION_CANCELED",
-    error: "翻译任务已取消"
+    error: "翻译任务已取消（弹窗主动取消）"
   });
 });
 

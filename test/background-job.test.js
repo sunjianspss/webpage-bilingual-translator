@@ -7,6 +7,7 @@ const originalSetTimeout = globalThis.setTimeout;
 
 let runtimeListener;
 let tabRemovedListener;
+let tabUpdatedListener;
 let storageReads = 0;
 let storedSettings = {};
 let fetchMode = "success";
@@ -67,6 +68,11 @@ globalThis.chrome = {
     onRemoved: {
       addListener(listener) {
         tabRemovedListener = listener;
+      }
+    },
+    onUpdated: {
+      addListener(listener) {
+        tabUpdatedListener = listener;
       }
     }
   },
@@ -282,7 +288,7 @@ test("canceling a job aborts its in-flight fetch and returns a structured error"
     ok: false,
     canceled: true,
     code: "TRANSLATION_CANCELED",
-    error: "翻译任务已取消"
+    error: "翻译任务已取消（弹窗主动取消）"
   });
   fetchMode = "success";
 });
@@ -316,7 +322,7 @@ test("releasing a job also aborts and deletes any in-flight work", async () => {
     ok: false,
     canceled: true,
     code: "TRANSLATION_CANCELED",
-    error: "翻译任务已取消"
+    error: "翻译任务已取消（弹窗释放任务）"
   });
   fetchMode = "success";
 });
@@ -528,4 +534,212 @@ test("the backend probe spends no round trip on DeepSeek", async () => {
 
   assert.deepEqual(checked, { ok: true });
   assert.equal(requests.length, requestCount);
+});
+
+test("an in-page anchor jump does not abandon a running translation", async () => {
+  const created = await dispatch({
+    type: "CREATE_TRANSLATION_JOB",
+    settings: translatorSettings(),
+    tabId: 41,
+    tabUrl: "https://vals.ai/blogs/fable-solves-cyphral-distich"
+  });
+
+  await tabUpdatedListener(41, {
+    url: "https://vals.ai/blogs/fable-solves-cyphral-distich#solution"
+  });
+
+  const translated = await dispatch(
+    {
+      type: "TRANSLATE_BATCH",
+      jobId: created.jobId,
+      segments: [{ id: "after-anchor", text: "Hello" }]
+    },
+    { tab: { id: 41 } }
+  );
+  assert.deepEqual(translated, {
+    ok: true,
+    translations: { "after-anchor": "译文" }
+  });
+  assert.equal(hasPersistedJob(created.jobId), true);
+
+  await dispatch({
+    type: "RELEASE_TRANSLATION_JOB",
+    jobId: created.jobId
+  });
+});
+
+test("leaving the document still disposes the job", async () => {
+  const created = await dispatch({
+    type: "CREATE_TRANSLATION_JOB",
+    settings: translatorSettings(),
+    tabId: 42,
+    tabUrl: "https://vals.ai/blogs/fable-solves-cyphral-distich"
+  });
+
+  await tabUpdatedListener(42, {
+    url: "https://vals.ai/blogs/another-post"
+  });
+
+  const afterNavigation = await dispatch(
+    {
+      type: "TRANSLATE_BATCH",
+      jobId: created.jobId,
+      segments: [{ id: "navigated", text: "Hello" }]
+    },
+    { tab: { id: 42 } }
+  );
+  assert.equal(afterNavigation.code, "TRANSLATION_JOB_NOT_FOUND");
+  assert.equal(hasPersistedJob(created.jobId), false);
+});
+
+test("a bare loading flip must not touch a running job", async () => {
+  const created = await dispatch({
+    type: "CREATE_TRANSLATION_JOB",
+    settings: translatorSettings(),
+    tabId: 43,
+    tabUrl: "https://vals.ai/blogs/fable-solves-cyphral-distich"
+  });
+
+  // 实测：滚动页面时 Next.js 去取路由分片，标签页的加载状态会翻一次，
+  // changeInfo 里没有 url,文档从头到尾没动过。据此销毁任务，就是
+  // "翻译到一半一滚动就被取消"。
+  await tabUpdatedListener(43, { status: "loading" });
+  await tabUpdatedListener(43, { status: "complete" });
+
+  const stillRunning = await dispatch(
+    {
+      type: "TRANSLATE_BATCH",
+      jobId: created.jobId,
+      segments: [{ id: "after-scroll", text: "Hello" }]
+    },
+    { tab: { id: 43 } }
+  );
+  assert.deepEqual(stillRunning, {
+    ok: true,
+    translations: { "after-scroll": "译文" }
+  });
+  assert.equal(hasPersistedJob(created.jobId), true);
+
+  // 文档真的要走时，内容脚本的 pagehide 会发 RELEASE——那才是可信的信号。
+  await dispatch({
+    type: "RELEASE_TRANSLATION_JOB",
+    jobId: created.jobId
+  });
+  assert.equal(hasPersistedJob(created.jobId), false);
+});
+
+test("a page can renew a lost job without ever seeing the API key", async () => {
+  storedSettings = translatorSettings({
+    localModel: "renewed-model",
+    localApiKey: "renewed-secret",
+    targetLanguage: "ko"
+  });
+
+  const renewed = await dispatch(
+    {
+      type: "RENEW_TRANSLATION_JOB",
+      targetLanguage: "en"
+    },
+    { tab: { id: 44, url: "https://example.com/post" } }
+  );
+
+  assert.equal(renewed.ok, true);
+  assert.doesNotMatch(JSON.stringify(renewed), /renewed-secret/);
+  // 页面这一轮一直在翻英文,续期不能把后半页切成存储里的韩文。
+  assert.equal(renewed.pageSettings.targetLanguage, "en");
+
+  const translated = await dispatch(
+    {
+      type: "TRANSLATE_BATCH",
+      jobId: renewed.jobId,
+      segments: [{ id: "renewed", text: "Hello" }]
+    },
+    { tab: { id: 44 } }
+  );
+  assert.deepEqual(translated, {
+    ok: true,
+    translations: { renewed: "译文" }
+  });
+  const request = requests.at(-1);
+  assert.equal(
+    request.options.headers.Authorization,
+    "Bearer renewed-secret"
+  );
+
+  await dispatch({
+    type: "RELEASE_TRANSLATION_JOB",
+    jobId: renewed.jobId
+  });
+});
+
+test("renewal is refused when the sender is not a page", async () => {
+  const refused = await dispatch({ type: "RENEW_TRANSLATION_JOB" });
+  assert.equal(refused.ok, false);
+  assert.equal(refused.code, "TRANSLATION_JOB_TAB_MISMATCH");
+});
+
+test("a cancelled batch names who cancelled it", async () => {
+  const created = await dispatch({
+    type: "CREATE_TRANSLATION_JOB",
+    settings: translatorSettings(),
+    tabId: 51,
+    tabUrl: "https://vals.ai/blogs/fable-solves-cyphral-distich"
+  });
+  fetchMode = "pending";
+  const started = waitForNextFetch();
+  const batchResponse = dispatch(
+    {
+      type: "TRANSLATE_BATCH",
+      jobId: created.jobId,
+      segments: [{ id: "mid-flight", text: "Hello" }]
+    },
+    { tab: { id: 51 } }
+  );
+  await started;
+
+  // 页面自己跳走了,和用户按下取消是两回事,红字必须分得清。
+  await tabUpdatedListener(51, {
+    url: "https://vals.ai/blogs/another-post"
+  });
+
+  assert.deepEqual(await batchResponse, {
+    ok: false,
+    canceled: true,
+    code: "TRANSLATION_CANCELED",
+    error: "翻译任务已取消（页面已跳转）"
+  });
+  fetchMode = "success";
+});
+
+test("a page cancel is told apart from a popup cancel", async () => {
+  const created = await dispatch({
+    type: "CREATE_TRANSLATION_JOB",
+    settings: translatorSettings(),
+    tabId: 52,
+    tabUrl: "https://example.com/post"
+  });
+  fetchMode = "pending";
+  const started = waitForNextFetch();
+  const batchResponse = dispatch(
+    {
+      type: "TRANSLATE_BATCH",
+      jobId: created.jobId,
+      segments: [{ id: "from-page", text: "Hello" }]
+    },
+    { tab: { id: 52 } }
+  );
+  await started;
+
+  await dispatch(
+    { type: "CANCEL_TRANSLATION_JOB", jobId: created.jobId },
+    { tab: { id: 52 } }
+  );
+
+  assert.deepEqual(await batchResponse, {
+    ok: false,
+    canceled: true,
+    code: "TRANSLATION_CANCELED",
+    error: "翻译任务已取消（页面主动取消）"
+  });
+  fetchMode = "success";
 });

@@ -68,6 +68,7 @@ function createHarness({
   const { window } = dom;
   const listeners = [];
   const runtimeMessages = [];
+  let renewalCount = 0;
   if (timerScale !== 1) {
     const nativeSetTimeout = window.setTimeout.bind(window);
     window.setTimeout = (callback, delay, ...args) =>
@@ -111,6 +112,14 @@ function createHarness({
         runtimeMessages.push(message);
         if (message?.type === "TRANSLATE_BATCH") {
           return translate(message, successfulTranslation);
+        }
+        if (message?.type === "RENEW_TRANSLATION_JOB") {
+          renewalCount += 1;
+          return {
+            ok: true,
+            jobId: `renewed-job-${renewalCount}`,
+            pageSettings: {}
+          };
         }
         return { ok: true };
       }
@@ -166,6 +175,7 @@ function createHarness({
     dispatch,
     dispatchAsync,
     document: window.document,
+    renewalCount: () => renewalCount,
     requestedSegments,
     runtimeMessages,
     start,
@@ -2415,4 +2425,156 @@ test("a binding placement budget keeps the top of the document, not whatever was
     "true",
     "the headline must actually receive its translation block"
   );
+});
+
+test("a lost background job is renewed instead of stranding the rest of the page", async (t) => {
+  const paragraphs = Array.from(
+    { length: 60 },
+    (_value, index) =>
+      `<p>Paragraph number ${index + 1} carries enough prose to be collected.</p>`
+  ).join("");
+  const lostJobId = "job-content-behavior";
+  const seenJobIds = new Set();
+  const harness = createHarness({
+    html: `<body><article>${paragraphs}</article></body>`,
+    translate(message) {
+      seenJobIds.add(message.jobId);
+      // service worker 被回收后,原任务记录就没了;页面这边整轮才刚开始。
+      if (message.jobId === lostJobId) {
+        return {
+          ok: false,
+          canceled: true,
+          code: "TRANSLATION_JOB_NOT_FOUND",
+          error: "翻译任务不存在或已结束"
+        };
+      }
+      return successfulTranslation(message);
+    }
+  });
+  t.after(harness.close);
+
+  harness.start();
+  const state = await waitForTerminalState(harness, 4000);
+
+  assert.equal(state.status, "done", state.error);
+  assert.equal(
+    harness.document.querySelectorAll(TRANSLATION_SELECTOR).length,
+    60,
+    "every paragraph must still get a translation"
+  );
+  assert.equal(
+    harness.renewalCount(),
+    1,
+    "concurrent workers must share one renewal round trip"
+  );
+  assert.equal(seenJobIds.has("renewed-job-1"), true);
+});
+
+test("an abandoned job stays fatal so cancelling still stops the page", async (t) => {
+  const paragraphs = Array.from(
+    { length: 60 },
+    (_value, index) =>
+      `<p>Paragraph number ${index + 1} carries enough prose to be collected.</p>`
+  ).join("");
+  const harness = createHarness({
+    html: `<body><article>${paragraphs}</article></body>`,
+    translate() {
+      return {
+        ok: false,
+        canceled: true,
+        code: "TRANSLATION_CANCELED",
+        error: "翻译任务已取消"
+      };
+    }
+  });
+  t.after(harness.close);
+
+  harness.start();
+  const state = await waitForTerminalState(harness, 4000);
+
+  assert.equal(state.status, "error");
+  assert.equal(state.error, "翻译任务已取消");
+  assert.equal(
+    harness.renewalCount(),
+    0,
+    "a deliberate cancel must not be resurrected"
+  );
+});
+
+test("a second shortcut press mid-run must not cancel the pass in flight", async (t) => {
+  const posts = Array.from(
+    { length: 6 },
+    (_value, index) =>
+      `<article><div data-testid="tweetText">Social post number ${index + 1} is long enough to be collected here.</div></article>`
+  ).join("");
+  // 多轮扫描的页面才暴露得出这个窗口：translateCurrentCandidates 每跑完
+  // 一轮就把 state.status 写回 "done"，而 translatePage 还在两轮之间的
+  // wait() 里等着。此刻按下的那一次，旧守卫是放行的。
+  const harness = createHarness({
+    url: "https://x.com/home",
+    html: `<main>${posts}</main>`
+  });
+  t.after(harness.close);
+
+  harness.start();
+  await waitFor(
+    () => harness.state().status === "done",
+    "the first pass to report done while later passes are still queued",
+    2000
+  );
+
+  const secondPress = harness.dispatch({
+    type: "TRANSLATE_PAGE",
+    jobId: "job-second-press",
+    settings: {
+      backend: "deepseek",
+      targetLanguage: "zh-CN",
+      viewMode: "bilingual",
+      maxSegments: 220
+    }
+  });
+  assert.equal(
+    secondPress.ok,
+    false,
+    "a press arriving between passes must not restart the run"
+  );
+  assert.equal(secondPress.code, "TRANSLATION_IN_PROGRESS");
+
+  // 快捷键那条路会把这次失败回送到页面上。它属于另一次启动尝试，不该
+  // 盖掉正在跑的那一轮的进度。
+  harness.dispatch({
+    type: "SHOW_TRANSLATION_ERROR",
+    error: "页面正在翻译，请稍候"
+  });
+  assert.notEqual(harness.state().status, "error");
+
+  assert.deepEqual(
+    harness.runtimeMessages.filter(
+      (message) => message?.type === "CANCEL_TRANSLATION_JOB"
+    ),
+    [],
+    "nothing may cancel the job the page is still translating with"
+  );
+});
+
+test("a press after the pass has settled starts a fresh one", async (t) => {
+  const harness = createHarness({
+    html: "<body><article><p>A paragraph long enough to collect here.</p></article></body>"
+  });
+  t.after(harness.close);
+
+  harness.start();
+  await waitForTerminalState(harness);
+
+  const secondPress = harness.dispatch({
+    type: "TRANSLATE_PAGE",
+    jobId: "job-later-press",
+    settings: {
+      backend: "deepseek",
+      targetLanguage: "zh-CN",
+      viewMode: "bilingual",
+      maxSegments: 220
+    }
+  });
+  assert.equal(secondPress.ok, true, "a finished page must be retranslatable");
 });

@@ -67,10 +67,22 @@
       return false;
     }
     const normalizedTarget = String(targetLanguage || "").toLowerCase();
-    return translations.every(
-      (translation) =>
-        String(translation.lang || "").toLowerCase() === normalizedTarget
-    );
+    return translations.every((translation) => {
+      if (String(translation.lang || "").toLowerCase() !== normalizedTarget) {
+        return false;
+      }
+      const sourceText = translation.dataset.translatorForHeading === "true"
+        ? translation.previousElementSibling?.textContent
+        : [...translation.parentNode.childNodes]
+          .filter((node) => node !== translation)
+          .map((node) => node.textContent)
+          .join(" ");
+      return !isUntranslatedText(
+        sourceText,
+        translation.textContent,
+        targetLanguage
+      );
+    });
   }
 
   function handleTaskError(session, error) {

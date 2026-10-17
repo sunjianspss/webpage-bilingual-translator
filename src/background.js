@@ -764,7 +764,11 @@ async function requestTranslations(segments, settings, jobSignal) {
       throw new Error("翻译服务返回了空内容");
     }
     try {
-      const translations = parseTranslations(content, requestSegments);
+      const translations = parseTranslations(
+        content,
+        requestSegments,
+        settings.targetLanguage
+      );
       const missing = requestSegments.filter(
         (item) => !translations[item.id]
       );

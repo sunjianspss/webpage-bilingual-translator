@@ -139,12 +139,12 @@
           group.key,
           generation
         ),
-        group.key
+        group
       );
       if (generation === "0") {
         lookup.set(
           legacyPersistentCacheKey(scope, targetLanguage, group.key),
-          group.key
+          group
         );
       }
     }
@@ -152,13 +152,17 @@
       return;
     }
 
-    for (const [storageKey, groupKey] of lookup) {
+    for (const [storageKey, group] of lookup) {
+      const groupKey = group.key;
       if (session.translationCache.has(groupKey)) {
         continue;
       }
       const value = stored?.[storageKey];
       const text = typeof value === "string" ? value : value?.text;
-      if (typeof text === "string" && text) {
+      if (
+        typeof text === "string" && text &&
+        !isUntranslatedText(group.text, text, targetLanguage)
+      ) {
         session.translationCache.set(groupKey, text);
       }
     }

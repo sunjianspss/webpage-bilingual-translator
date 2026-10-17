@@ -6,6 +6,22 @@
   }
   globalThis.__AI_PAGE_TRANSLATOR_LOADED__ = true;
 
+  function isUntranslatedText(sourceText, translatedText, targetLanguage) {
+    if (!/^zh(?:-CN|-TW)?$/i.test(String(targetLanguage || ""))) {
+      return false;
+    }
+    const han = /\p{Script=Han}/u;
+    if (han.test(String(sourceText || "")) || han.test(String(translatedText || ""))) {
+      return false;
+    }
+    const prose = String(sourceText || "")
+      .replace(/https?:\/\/\S+|www\.\S+|[\w.+-]+@[\w.-]+\.[a-z]+|[@#][\w]+/gi, " ");
+    const words = prose.match(/[a-z]+(?:['’][a-z]+)*/gi) || [];
+    return words.length >= 4 &&
+      words.join("").length >= 20 &&
+      words.filter((word) => /^[a-z]{2}/.test(word)).length >= 2;
+  }
+
   const MARKER = "data-ai-page-translator";
   const OWNED_MARKER = "data-ai-page-translator-owned";
   const ORIGINAL_CLASS = "ai-page-translator-original";
@@ -268,10 +284,22 @@
       return false;
     }
     const normalizedTarget = String(targetLanguage || "").toLowerCase();
-    return translations.every(
-      (translation) =>
-        String(translation.lang || "").toLowerCase() === normalizedTarget
-    );
+    return translations.every((translation) => {
+      if (String(translation.lang || "").toLowerCase() !== normalizedTarget) {
+        return false;
+      }
+      const sourceText = translation.dataset.translatorForHeading === "true"
+        ? translation.previousElementSibling?.textContent
+        : [...translation.parentNode.childNodes]
+          .filter((node) => node !== translation)
+          .map((node) => node.textContent)
+          .join(" ");
+      return !isUntranslatedText(
+        sourceText,
+        translation.textContent,
+        targetLanguage
+      );
+    });
   }
 
   function handleTaskError(session, error) {
@@ -993,6 +1021,13 @@
         });
         assertCurrentTask(taskId);
         if (response?.ok) {
+          if (batch.some((segment) => isUntranslatedText(
+            segment.text,
+            response.translations?.[segment.id],
+            session.settings.targetLanguage
+          ))) {
+            throw new Error("模型未将正文翻译成中文");
+          }
           return response;
         }
         const responseError = new Error(response?.error || lastError);
@@ -1210,12 +1245,12 @@
           group.key,
           generation
         ),
-        group.key
+        group
       );
       if (generation === "0") {
         lookup.set(
           legacyPersistentCacheKey(scope, targetLanguage, group.key),
-          group.key
+          group
         );
       }
     }
@@ -1223,13 +1258,17 @@
       return;
     }
 
-    for (const [storageKey, groupKey] of lookup) {
+    for (const [storageKey, group] of lookup) {
+      const groupKey = group.key;
       if (session.translationCache.has(groupKey)) {
         continue;
       }
       const value = stored?.[storageKey];
       const text = typeof value === "string" ? value : value?.text;
-      if (typeof text === "string" && text) {
+      if (
+        typeof text === "string" && text &&
+        !isUntranslatedText(group.text, text, targetLanguage)
+      ) {
         session.translationCache.set(groupKey, text);
       }
     }

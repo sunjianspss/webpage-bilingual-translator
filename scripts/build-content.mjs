@@ -1,5 +1,6 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
+import { isUntranslatedText } from "../src/shared.js";
 
 // state.js 必须排在最前:它包含常量、可变状态和消息监听等顶层执行语句,
 // 其余文件只含函数声明(提升生效),顺序仅影响可读性。
@@ -37,7 +38,14 @@ export async function buildContentScript() {
       readFile(new URL(`../src/content/${name}`, import.meta.url), "utf8")
     )
   );
-  const body = parts.map((part) => part.trimEnd()).join("\n\n");
+  // 内容脚本以单文件注入，不能运行 ESM import；复用同一个纯函数，
+  // 避免后台的输出检查和页面的缓存检查各自维护一套判定。
+  const qualityCheck = isUntranslatedText.toString()
+    .split("\n")
+    .map((line) => `  ${line}`)
+    .join("\n");
+  const body = [qualityCheck, ...parts.map((part) => part.trimEnd())]
+    .join("\n\n");
   return `${BANNER}${HEADER}${body}\n${FOOTER}`;
 }
 

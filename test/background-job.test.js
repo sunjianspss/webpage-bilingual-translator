@@ -178,6 +178,66 @@ function hasPersistedJob(jobId) {
   );
 }
 
+test("untranslated Chinese output triggers batch splitting and cannot succeed as a single segment", async (t) => {
+  const previousFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = previousFetch;
+  });
+  const text =
+    "What is ChatGPT Space, that is the question. What would you like to see next?";
+  const modelResponse = (translations) => ({
+    ok: true,
+    async json() {
+      return {
+        choices: [{ message: { content: JSON.stringify({ translations }) } }]
+      };
+    }
+  });
+  for (const backend of ["local", "deepseek"]) {
+    const created = await dispatch({
+      type: "CREATE_TRANSLATION_JOB",
+      tabId: 87,
+      settings: translatorSettings({ backend, targetLanguage: "zh-CN" })
+    });
+    const requestedSizes = [];
+    globalThis.fetch = async (_url, options) => {
+      const input = JSON.parse(JSON.parse(options.body).messages[1].content);
+      const segments = Array.isArray(input)
+        ? input.map(([id, text]) => ({ id, text }))
+        : input.segments;
+      requestedSizes.push(segments.length);
+      return modelResponse(segments.map(({ id, text }) => ({
+        id,
+        text: segments.length > 1 ? text : "你接下来想看到什么？"
+      })));
+    };
+    const result = await dispatch({
+      type: "TRANSLATE_BATCH",
+      jobId: created.jobId,
+      segments: [{ id: "a", text }, { id: "b", text }]
+    }, { tab: { id: 87 } });
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.translations, {
+      a: "你接下来想看到什么？",
+      b: "你接下来想看到什么？"
+    });
+    assert.deepEqual(requestedSizes, [2, 1, 1]);
+
+    globalThis.fetch = async () => modelResponse([
+      { id: backend === "local" ? "1" : "a", text }
+    ]);
+    const rejected = await dispatch({
+      type: "TRANSLATE_BATCH",
+      jobId: created.jobId,
+      segments: [{ id: "a", text }]
+    }, { tab: { id: 87 } });
+    assert.equal(rejected.ok, false);
+    assert.equal(rejected.code, "MODEL_OUTPUT");
+    assert.match(rejected.error, /未.*翻译/);
+    await dispatch({ type: "RELEASE_TRANSLATION_JOB", jobId: created.jobId });
+  }
+});
+
 test("translation jobs snapshot settings and keep secrets out of page settings", async () => {
   const suppliedSettings = translatorSettings();
   const created = await dispatch({

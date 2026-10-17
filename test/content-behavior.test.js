@@ -209,6 +209,117 @@ async function waitForTerminalState(harness, timeout = 800) {
   );
 }
 
+const UNTRANSLATED_POST =
+  "What is ChatGPT Space, that is the question. Endearingly awkward at times " +
+  "because it's the actual team working on it. What would you like to see next?";
+
+test("retries untranslated English instead of displaying and caching it as Chinese", async (t) => {
+  let attempts = 0;
+  const store = {};
+  const harness = createHarness({
+    html: `<main><div data-testid="tweetText">${UNTRANSLATED_POST}</div></main>`,
+    storageStore: store,
+    timerScale: 0.01,
+    translate(message, success) {
+      attempts += 1;
+      return attempts === 1
+        ? {
+          ok: true,
+          translations: { [message.segments[0].id]: UNTRANSLATED_POST }
+        }
+        : success(message);
+    }
+  });
+  t.after(harness.close);
+  harness.start();
+  const state = await waitForTerminalState(harness);
+  assert.equal(state.status, "done", state.error);
+  assert.equal(attempts, 2);
+  assert.match(
+    harness.document.querySelector(TRANSLATION_SELECTOR).textContent,
+    /译文/
+  );
+  await waitFor(
+    () => Object.keys(store).some((key) => key.startsWith("aiPageTranslatorCache:")),
+    "valid cache write"
+  );
+  assert.ok(!Object.values(store).some((value) => value?.text === UNTRANSLATED_POST));
+});
+
+test("persistent untranslated output reports failure without rendering or caching English", async (t) => {
+  const store = {};
+  const harness = createHarness({
+    html: `<main><p>${UNTRANSLATED_POST}</p></main>`,
+    storageStore: store,
+    timerScale: 0.01,
+    translate: (message) => ({
+      ok: true,
+      translations: { [message.segments[0].id]: UNTRANSLATED_POST }
+    })
+  });
+  t.after(harness.close);
+  harness.start();
+  const state = await waitForTerminalState(harness);
+  assert.equal(state.status, "error");
+  assert.match(state.error, /未.*翻译/);
+  assert.equal(state.translated, 0);
+  assert.equal(harness.requestedSegments().length, 2);
+  assert.equal(harness.document.querySelector(TRANSLATION_SELECTOR), null);
+  assert.ok(!Object.keys(store).some((key) => key.startsWith("aiPageTranslatorCache:")));
+});
+
+test("ignores old untranslated cache values in both supported storage formats", async (t) => {
+  for (const legacy of [false, true]) {
+    const store = {};
+    const html = `<main><p>${UNTRANSLATED_POST}</p></main>`;
+    const first = createHarness({ html, storageStore: store });
+    t.after(first.close);
+    first.start();
+    await waitForTerminalState(first);
+    const key = await waitFor(
+      () => Object.keys(store).find((key) => key.startsWith("aiPageTranslatorCache:")),
+      "cache entry"
+    );
+    store[key] = legacy
+      ? UNTRANSLATED_POST
+      : { ...store[key], text: UNTRANSLATED_POST };
+    const second = createHarness({ html, storageStore: store });
+    t.after(second.close);
+    second.start();
+    const state = await waitForTerminalState(second);
+    assert.equal(state.status, "done", state.error);
+    assert.equal(
+      second.requestedSegments().length,
+      1,
+      "untranslated cached text must be requested again"
+    );
+    assert.match(
+      second.document.querySelector(TRANSLATION_SELECTOR).textContent,
+      /译文/
+    );
+  }
+});
+
+test("starting again replaces untranslated English already left in the DOM", async (t) => {
+  const harness = createHarness({
+    html: `<main>
+      <div data-testid="tweetText" data-ai-page-translator="true"
+           data-translator-target="element"><span>${UNTRANSLATED_POST}</span><span
+           class="ai-page-translator-translation" data-ai-page-translator-owned="true"
+           data-translator-for-element="true" lang="zh-CN">${UNTRANSLATED_POST}</span></div>
+    </main>`
+  });
+  t.after(harness.close);
+  harness.start();
+  const state = await waitForTerminalState(harness);
+  assert.equal(state.status, "done", state.error);
+  assert.equal(harness.requestedSegments().length, 1);
+  assert.match(
+    harness.document.querySelector(TRANSLATION_SELECTOR).textContent,
+    /译文/
+  );
+});
+
 test("fans one unique translation out to every DOM occurrence", async (t) => {
   const repeated = "The same reusable notice appears in two separate cards.";
   const harness = createHarness({
@@ -1412,7 +1523,7 @@ test("clearing one page does not discard another page's in-flight cache write", 
       return {
         ok: true,
         translations: Object.fromEntries(
-          message.segments.map(({ id }) => [id, "OTHER-PAGE-VALUE"])
+          message.segments.map(({ id }) => [id, "其他页面的译文"])
         )
       };
     }
@@ -1432,14 +1543,14 @@ test("clearing one page does not discard another page's in-flight cache write", 
   releaseOtherPageWrite();
   await waitFor(
     () => Object.values(sharedStore).some(
-      (value) => value?.text === "OTHER-PAGE-VALUE"
+      (value) => value?.text === "其他页面的译文"
     ),
     "the unrelated page cache write to remain valid"
   );
   await new Promise((resolve) => setTimeout(resolve, 40));
   assert.ok(
     Object.values(sharedStore).some(
-      (value) => value?.text === "OTHER-PAGE-VALUE"
+      (value) => value?.text === "其他页面的译文"
     )
   );
 });
@@ -1475,7 +1586,7 @@ test("a stale write stays invalid after its page tombstone expires", async (t) =
       return {
         ok: true,
         translations: Object.fromEntries(
-          message.segments.map(({ id }) => [id, "LATE-STALE-VALUE"])
+          message.segments.map(({ id }) => [id, "迟到的过期译文"])
         )
       };
     }
@@ -1508,7 +1619,7 @@ test("a stale write stays invalid after its page tombstone expires", async (t) =
       return {
         ok: true,
         translations: Object.fromEntries(
-          message.segments.map(({ id }) => [id, "MAINTENANCE-VALUE"])
+          message.segments.map(({ id }) => [id, "维护页面的译文"])
         )
       };
     }
@@ -1525,14 +1636,14 @@ test("a stale write stays invalid after its page tombstone expires", async (t) =
   releaseLateWrite();
   await waitFor(
     () => Object.values(sharedStore).some(
-      (value) => value?.text === "MAINTENANCE-VALUE"
+      (value) => value?.text === "维护页面的译文"
     ),
     "the maintenance cache write"
   );
   await new Promise((resolve) => setTimeout(resolve, 40));
   assert.ok(
     Object.values(sharedStore).every(
-      (value) => value?.text !== "LATE-STALE-VALUE"
+      (value) => value?.text !== "迟到的过期译文"
     ),
     "the pre-clear writer must remain stale after page metadata is reclaimed"
   );
@@ -1581,7 +1692,7 @@ test("a delayed generation read cannot extend a pre-clear writer's lifetime", as
       return {
         ok: true,
         translations: Object.fromEntries(
-          message.segments.map(({ id }) => [id, "DELAYED-READ-STALE"])
+          message.segments.map(({ id }) => [id, "延迟读取后的过期译文"])
         )
       };
     }
@@ -1627,7 +1738,7 @@ test("a delayed generation read cannot extend a pre-clear writer's lifetime", as
   await new Promise((resolve) => setTimeout(resolve, 50));
   assert.ok(
     Object.values(sharedStore).every(
-      (value) => value?.text !== "DELAYED-READ-STALE"
+      (value) => value?.text !== "延迟读取后的过期译文"
     )
   );
 });
@@ -1664,7 +1775,7 @@ test("an old prune snapshot cannot delete a concurrently refreshed page marker",
       return {
         ok: true,
         translations: Object.fromEntries(
-          message.segments.map(({ id }) => [id, "PRUNE-RACE-STALE"])
+          message.segments.map(({ id }) => [id, "清理竞态中的过期译文"])
         )
       };
     }
@@ -1732,7 +1843,7 @@ test("an old prune snapshot cannot delete a concurrently refreshed page marker",
   );
   assert.ok(
     Object.values(sharedStore).every(
-      (value) => value?.text !== "PRUNE-RACE-STALE"
+      (value) => value?.text !== "清理竞态中的过期译文"
     )
   );
 });

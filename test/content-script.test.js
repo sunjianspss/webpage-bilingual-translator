@@ -298,7 +298,7 @@ test("local background compacts segment ids and restores original ids", async ()
   );
 
   assert.match(content, /const requestSegments = isDeepSeek\s*\?\s*segments\s*:\s*compactSegmentIds\(segments\)/);
-  assert.match(content, /parseTranslations\(content, requestSegments\)/);
+  assert.match(content, /parseTranslations\(\s*content,\s*requestSegments,\s*settings\.targetLanguage\s*\)/);
   assert.match(content, /restoreSegmentIds\(translations, segments\)/);
   assert.match(content, /id: String\(index \+ 1\)/);
 });

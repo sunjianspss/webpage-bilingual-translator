@@ -562,6 +562,13 @@
         });
         assertCurrentTask(taskId);
         if (response?.ok) {
+          if (batch.some((segment) => isUntranslatedText(
+            segment.text,
+            response.translations?.[segment.id],
+            session.settings.targetLanguage
+          ))) {
+            throw new Error("模型未将正文翻译成中文");
+          }
           return response;
         }
         const responseError = new Error(response?.error || lastError);

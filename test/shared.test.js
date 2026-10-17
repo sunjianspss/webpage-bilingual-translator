@@ -51,6 +51,55 @@ test("keeps only expected translation IDs", () => {
   );
 });
 
+test("rejects untranslated English prose for Chinese targets", () => {
+  const text =
+    "What is ChatGPT Space, that is the question. What would you like to see next?";
+  const outputs = [
+    text,
+    "What is ChatGPT Space? That is the question. What would you like to see next?"
+  ];
+  for (const target of ["zh-CN", "zh-TW"]) {
+    for (const output of outputs) {
+      assert.throws(
+        () => parseTranslations(
+          JSON.stringify({ translations: [{ id: "1", text: output }] }),
+          [{ id: "1", text }],
+          target
+        ),
+        (error) => error.code === "MODEL_OUTPUT" && /未.*翻译/.test(error.message)
+      );
+    }
+  }
+});
+
+test("Chinese output validation preserves names, links, numbers and Chinese source", () => {
+  for (const text of [
+    "OpenAI ChatGPT Space",
+    "Microsoft Azure OpenAI ChatGPT",
+    "GPT-5.4 / 2026",
+    "https://example.com/what/is/the/question @thsottiaux #ChatGPT",
+    "今天讨论 ChatGPT Space 的新功能。"
+  ]) {
+    assert.deepEqual(
+      parseTranslations(
+        JSON.stringify({ translations: [{ id: "1", text }] }),
+        [{ id: "1", text }],
+        "zh-CN"
+      ),
+      { 1: text }
+    );
+  }
+  const text = "What would you like to see next?";
+  assert.deepEqual(
+    parseTranslations(
+      JSON.stringify({ translations: [{ id: "1", text }] }),
+      [{ id: "1", text }],
+      "en"
+    ),
+    { 1: text }
+  );
+});
+
 // 单片段批次的输入形如 [["1","…"]]，本地模型经常照抄这个数组形状，
 // 把 {"translations": …} 外层壳丢掉。预热批次受 1400 字符上限约束，
 // 常常正好只有一个片段，所以这条路径每次翻译都会走到。

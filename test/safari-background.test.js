@@ -126,6 +126,52 @@ function waitForNativeRequest() {
   });
 }
 
+test("Safari rejects untranslated English returned for a Chinese target", async (t) => {
+  const previousNative = chrome.runtime.sendNativeMessage;
+  t.after(() => {
+    chrome.runtime.sendNativeMessage = previousNative;
+  });
+  chrome.runtime.sendNativeMessage = async (_host, request) => {
+    const input = JSON.parse(JSON.parse(request.body).messages[1].content);
+    const segments = Array.isArray(input)
+      ? input.map(([id, text]) => ({ id, text }))
+      : input.segments;
+    return {
+      ok: true,
+      status: 200,
+      payload: {
+        choices: [{ message: {
+          content: JSON.stringify({ translations: segments })
+        } }]
+      }
+    };
+  };
+  for (const backend of ["local", "deepseek"]) {
+    const created = await dispatch({
+      type: "CREATE_TRANSLATION_JOB",
+      tabId: 88,
+      settings: {
+        ...translatorSettings(),
+        backend,
+        targetLanguage: "zh-CN",
+        deepseekApiKey: "test-key"
+      }
+    });
+    const result = await dispatch({
+      type: "TRANSLATE_BATCH",
+      jobId: created.jobId,
+      segments: [{
+        id: "post",
+        text: "What is ChatGPT Space, that is the question. What would you like to see next?"
+      }]
+    }, { tab: { id: 88 } });
+    assert.equal(result.ok, false);
+    assert.equal(result.code, "MODEL_OUTPUT");
+    assert.match(result.error, /未.*翻译/);
+    await dispatch({ type: "RELEASE_TRANSLATION_JOB", jobId: created.jobId });
+  }
+});
+
 async function startPendingBatch(tabId, segmentId) {
   const created = await dispatch({
     type: "CREATE_TRANSLATION_JOB",
